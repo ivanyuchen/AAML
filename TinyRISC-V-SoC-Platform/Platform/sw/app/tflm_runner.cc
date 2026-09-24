@@ -19,27 +19,31 @@
 #define MODEL_NAME "unknown"
 #endif
 
-namespace {
+namespace
+{
 
-alignas(16) uint8_t tensor_arena[TENSOR_ARENA_SIZE];
+  alignas(16) uint8_t tensor_arena[TENSOR_ARENA_SIZE];
 
-void print_duration(uint64_t cycles) {
-  printf("Cycles: ");
-  perf_print_cycles(cycles);
-  putchar('\n');
-  perf_print_time_ms(cycles);
-}
+  void print_duration(uint64_t cycles)
+  {
+    printf("Cycles: ");
+    perf_print_cycles(cycles);
+    putchar('\n');
+    perf_print_time_ms(cycles);
+  }
 
-}  // namespace
+} // namespace
 
-void tflm_run_inference(void) {
+void tflm_run_inference(void)
+{
   printf("\n=== TFLM Functional Verification ===\n");
   printf("Model: %s (%d bytes)\n", MODEL_NAME, g_model_len);
   printf("Tensor arena: %u bytes\n", (unsigned)sizeof(tensor_arena));
   model_io_print_profile();
 
-  const tflite::Model* model = tflite::GetModel(g_model);
-  if (model->version() != TFLITE_SCHEMA_VERSION) {
+  const tflite::Model *model = tflite::GetModel(g_model);
+  if (model->version() != TFLITE_SCHEMA_VERSION)
+  {
     printf("Model schema mismatch: got %d, expected %d\n", model->version(),
            TFLITE_SCHEMA_VERSION);
     return;
@@ -50,21 +54,24 @@ void tflm_run_inference(void) {
 
   tflite::MicroInterpreter interpreter(model, resolver, tensor_arena,
                                        sizeof(tensor_arena));
-  if (interpreter.AllocateTensors() != kTfLiteOk) {
+  if (interpreter.AllocateTensors() != kTfLiteOk)
+  {
     printf("AllocateTensors failed.\n");
     return;
   }
 
-  TfLiteTensor* input = interpreter.input(0);
-  TfLiteTensor* output = interpreter.output(0);
-  if (input == 0 || output == 0) {
+  TfLiteTensor *input = interpreter.input(0);
+  TfLiteTensor *output = interpreter.output(0);
+  if (input == 0 || output == 0)
+  {
     printf("Model tensors are not available.\n");
     return;
   }
 
   const size_t sample_count = model_io_sample_count();
   uint64_t total_cycles = 0;
-  for (size_t sample_index = 0; sample_index < sample_count; ++sample_index) {
+  for (size_t sample_index = 0; sample_index < sample_count; ++sample_index)
+  {
     printf("\n--- Sample %u/%u ---\n", (unsigned)(sample_index + 1),
            (unsigned)sample_count);
     model_io_prepare_input(input, sample_index);
@@ -75,18 +82,27 @@ void tflm_run_inference(void) {
     uint64_t cycles = perf_get_mcycle64() - start_cycles;
     total_cycles += cycles;
 
-    if (status != kTfLiteOk) {
+    if (status != kTfLiteOk)
+    {
       printf("Invoke failed.\n");
       print_duration(cycles);
       return;
     }
 
     printf("Inference complete.\n");
+    printf("Output Data:\n");
+    uint32_t *out_raw_bits = reinterpret_cast<uint32_t *>(output->data.f);
+
+    for (int i = 0; i < 12; ++i)
+    {
+      printf("%-9d: 0x%08X\n", i, (unsigned)out_raw_bits[i]);
+    }
     model_io_verify_output(output, sample_index);
     print_duration(cycles);
   }
 
-  if (sample_count > 1) {
+  if (sample_count > 1)
+  {
     printf("\nTotal for %u samples:\n", (unsigned)sample_count);
     print_duration(total_cycles);
   }
