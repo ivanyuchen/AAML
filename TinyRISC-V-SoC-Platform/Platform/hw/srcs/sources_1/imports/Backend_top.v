@@ -15,6 +15,7 @@ module Backend_top (
     output [31:0] redirect_pc_o,
     output        invalidate_o,
     input         invalid_complete_i,
+    output        ifetch_hold_o,      // fence.i: hold I-cache refills until the D-cache writeback walk ends
 
     // Control-flow resolution feedback to the frontend predictor/BTB
     output        resolve_valid_o,
@@ -172,6 +173,19 @@ assign redirect_pc_o    = redirect_flush
     : ras_predict_pc;
 
 assign invalidate_o = fencei_flush;
+
+// fence.i redirects/invalidates the I-cache from EX, but the stored code may still
+// sit dirty in the D-cache: block I-cache refills until MEM's clean_all walk is done.
+// Plain fence also sets fetch_invalid but never reaches the walk, so it is excluded.
+wire EX_is_fencei = (EX_mem_ctrl_out == 4'b0110);
+wire dcache_clean_done;
+reg  fencei_wait;
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n)                           fencei_wait <= 1'b0;
+    else if (fencei_flush & EX_is_fencei) fencei_wait <= 1'b1;
+    else if (dcache_clean_done)           fencei_wait <= 1'b0;
+end
+assign ifetch_hold_o = fencei_wait;
 
 // Never allocate/train JALR in the predictor or BTB. Its dynamic target is
 // resolved by the forwarded ALU operands in EX on every execution.
@@ -576,7 +590,7 @@ wire        mem_hit;
 wire [31:0] mem_dcache_daddr, mem_dcache_data;
 wire [ 3:0] mem_dcache_mask;
 wire        mem_dcache_req_rd, mem_dcache_req_wr;
-wire        mem_dcache_flush, mem_dcache_invalidate, mem_dcache_writeback;
+wire        mem_dcache_flush, mem_dcache_invalidate, mem_dcache_writeback, mem_dcache_clean_all;
 wire [31:0] mem_writeback_value;
 wire        mem_writeback_valid;
 
@@ -619,6 +633,7 @@ MEM m_MEM (
     .dcache_mask_o       (mem_dcache_mask), .dcache_req_rd_o     (mem_dcache_req_rd),
     .dcache_req_wr_o     (mem_dcache_req_wr), .dcache_flush_o      (mem_dcache_flush),
     .dcache_invalidate_o (mem_dcache_invalidate), .dcache_writeback_o  (mem_dcache_writeback),
+    .dcache_clean_all_o  (mem_dcache_clean_all), .dcache_clean_done_i (dcache_clean_done),
     .dcache_resp_data_i  (dcache_in_value_i), .dcache_resp_valid_i (dcache_in_valid_i),
     .dcache_hit_i        (dcache_hit_o),
 
@@ -674,6 +689,7 @@ dcache_pro m_dcache (
     .cpu_req_rd        (mem_dcache_req_rd), .cpu_data_o        (dcache_in_value_i), .dcache_rdy_o      (),
     .dcache_data_vld_o (dcache_in_valid_i), .d_exception       (), .hit_o             (dcache_hit_o), .invalidate_i      (mem_dcache_invalidate),
     .flush_i           (mem_dcache_flush), .writeback_i       (mem_dcache_writeback), .mem_addr          (dbus_rm_addr),
+    .clean_all_i       (mem_dcache_clean_all), .clean_done_o      (dcache_clean_done),
     .rm_rdy            (dbus_rm_rdy), .rm_data           (dbus_rm_data), .rm_success        (dbus_rm_success),
     .rm_complete       (dbus_rm_complete), .rm_vld            (dbus_rm_vld), .wm_rdy            (dbus_wm_rdy),
     .wm_data           (dbus_wm_data), .wm_vld            (dbus_wm_vld), .wm_success        (dbus_wm_success),

@@ -19,36 +19,38 @@ module QuotientSelect (
     //Output: above data in the next iteration
     
     wire [65:0] r_1, r_2;
-    wire [5:0] r; 
 
-    wire [7:0] pre_add_r;
+    // 4r estimate in units of 2^60; |4r| reaches 8/3*d (~43 units), so keep all 8 bits signed
+    wire signed [7:0] pre_add_r;
 
     assign pre_add_r = r_1_i[65:58] + r_2_i[65:58];
-    assign r = {pre_add_r[7], pre_add_r[4:0]};
 
-    assign r_1 = {r,    r_1_i[57:0], 2'b0};
-    assign r_2 = {6'b0, r_2_i[57:0], 2'b0};
-    
-    wire [5:0] d_p;
-    wire [5:0] d_p_0_5;
-    wire [5:0] d_p_1_5;
-    wire [5:0] d_n;
-    wire [5:0] d_n_0_5;
-    wire [5:0] d_n_1_5;
+    // Shift by 2 is modulo 2^66, so the new top 6 bits are pre_add_r[5:0]
+    assign r_1 = {pre_add_r[5:0], r_1_i[57:0], 2'b0};
+    assign r_2 = {6'b0,           r_2_i[57:0], 2'b0};
 
-    assign d_p = d[33:28];
-    assign d_n = neg_d[33:28];
+    // Selection thresholds per d[30:28] (d[31]=1 after normalization), valid for carry-save error < 2 units
+    reg signed [7:0] m_n1, m_0, m_1, m_2;
 
-    assign d_p_0_5 = d_p >>> 1;
-    assign d_n_0_5 = {d_n[5], d_n[5:1]};
-
-    assign d_p_1_5 = d_p + d_p_0_5;
-    assign d_n_1_5 = d_n + d_n_0_5;
+    always @(*) begin
+        case (d[30:28])
+            3'd0: begin m_n1 = -8'sd13; m_0 = -8'sd4; m_1 = 8'sd4; m_2 = 8'sd12; end
+            3'd1: begin m_n1 = -8'sd15; m_0 = -8'sd5; m_1 = 8'sd5; m_2 = 8'sd14; end
+            3'd2: begin m_n1 = -8'sd16; m_0 = -8'sd5; m_1 = 8'sd5; m_2 = 8'sd15; end
+            3'd3: begin m_n1 = -8'sd17; m_0 = -8'sd6; m_1 = 8'sd5; m_2 = 8'sd17; end
+            3'd4: begin m_n1 = -8'sd19; m_0 = -8'sd7; m_1 = 8'sd6; m_2 = 8'sd19; end
+            3'd5: begin m_n1 = -8'sd20; m_0 = -8'sd7; m_1 = 8'sd6; m_2 = 8'sd20; end
+            3'd6: begin m_n1 = -8'sd22; m_0 = -8'sd7; m_1 = 8'sd7; m_2 = 8'sd21; end
+            default: begin m_n1 = -8'sd24; m_0 = -8'sd8; m_1 = 8'sd8; m_2 = 8'sd23; end
+        endcase
+    end
 
     wire [2:0] q;
 
-    assign q = r[5] ? ((r >= d_n_0_5) ? 3'b000 : (r >= d_n_1_5) ? 3'b111 : 3'b110):
-                      ((r > d_p_1_5) ? 3'b010 : (r > d_p_0_5) ? 3'b001 : 3'b000);
+    assign q = (pre_add_r >= m_2)  ? 3'b010 :
+               (pre_add_r >= m_1)  ? 3'b001 :
+               (pre_add_r >= m_0)  ? 3'b000 :
+               (pre_add_r >= m_n1) ? 3'b111 : 3'b110;
 
     reg [65:0] sub;
 

@@ -68,13 +68,17 @@ module SRTDivider (
     wire [31:0] q_out; // final process (19)
     wire [33:0] r_out; // final process (19)
     wire d_zero;
+    wire d_one;
 
     assign q_out = r_pos_q_o[20] - r_neg_q_o[20];
     assign r_out = (r_r_1_o[20][65:32] + r_r_2_o[20][65:32]) >>> r_shift_o[20];
     assign d_zero = ~(|r_d_o[20]);
+    assign d_one = (r_shift_o[20] == 5'd31); // |divisor| == 1: initial r ~ d breaks SRT bound r <= 2/3 d, bypass
 
-    assign quotient = d_zero ? -1 : (r_r_sign_o[20] ^ r_d_sign_o[20]) & (~r_unsign_o[20]) ? -q_out : q_out; // divide by 0: q = -1
-    assign remain = d_zero ? r_r_o[20] : r_r_sign_o[20] & (~r_unsign_o[20]) ? -r_out[31:0] : r_out[31:0]; // divide by 0: r = r_input
+    assign quotient = d_zero ? -1 :
+                      d_one  ? (r_d_sign_o[20] & (~r_unsign_o[20]) ? -r_r_o[20] : r_r_o[20]) :
+                      (r_r_sign_o[20] ^ r_d_sign_o[20]) & (~r_unsign_o[20]) ? -q_out : q_out; // divide by 0: q = -1
+    assign remain = d_zero ? r_r_o[20] : d_one ? 32'b0 : r_r_sign_o[20] & (~r_unsign_o[20]) ? -r_out[31:0] : r_out[31:0]; // divide by 0: r = r_input
 
     assign DIV_out = r_rem_o[20] ? remain : quotient;
     assign DIV_done = r_start_o[20];

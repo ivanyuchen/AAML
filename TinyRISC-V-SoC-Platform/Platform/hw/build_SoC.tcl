@@ -100,9 +100,13 @@ if {[file exists $bit_src]} {
 set report_dir [file normalize "$root_dir/build/reports"]
 set timing_report "$report_dir/post_route_timing_summary.rpt"
 set npu_report "$report_dir/post_route_utilization_npu.rpt"
+set top_report "$report_dir/post_route_utilization_top.rpt"
 
 file mkdir $report_dir
 open_run impl_1
+
+report_utilization -file $top_report
+puts ">> \[TCL\] Post-route Top utilization report: $top_report"
 
 report_timing_summary \
     -delay_type min_max \

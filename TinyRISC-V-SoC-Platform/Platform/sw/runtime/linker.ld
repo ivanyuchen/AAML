@@ -7,8 +7,8 @@ MEMORY
     DDR3_RAM (rwx) : ORIGIN = 0x60000000, LENGTH = 256M
 }
 
-_STACK_SIZE = 512K;
-_HEAP_SIZE  = 512K;
+_STACK_SIZE = 64M;
+_HEAP_SIZE  = 64M;
 
 SECTIONS
 {
@@ -47,17 +47,8 @@ SECTIONS
         __bss_end = .;
     } > DDR3_RAM
 
-    .stack (NOLOAD) : {
-        . = ALIGN(16);
-        _stack_bottom = .;
-        _stack_end = .;
-        . += _STACK_SIZE;
-        _stack_start = .;
-        __stack_top = .;
-    } > DDR3_RAM
-
     .heap (NOLOAD) : {
-        . = ALIGN(8);
+        . = ALIGN(16);
         _heap_start = .;
         . += _HEAP_SIZE;
         _heap_end = .;
@@ -65,6 +56,18 @@ SECTIONS
 
     _end = _heap_start;
 
+    .stack (NOLOAD) : {
+        . = ORIGIN(DDR3_RAM) + LENGTH(DDR3_RAM) - _STACK_SIZE;
+        . = ALIGN(16);
+
+        _stack_bottom = .;
+        . += _STACK_SIZE;
+        _stack_top = .;
+        __stack_top = .;
+    } > DDR3_RAM
+
     ASSERT(_heap_end <= ORIGIN(DDR3_RAM) + LENGTH(DDR3_RAM),
-           "DDR3 RAM overflow: sections, stack, and heap exceed 256 MiB")
+           "DDR3 RAM overflow: heap")
+    ASSERT(_stack_top <= ORIGIN(DDR3_RAM) + LENGTH(DDR3_RAM),
+           "DDR3 RAM overflow: stack")
 }

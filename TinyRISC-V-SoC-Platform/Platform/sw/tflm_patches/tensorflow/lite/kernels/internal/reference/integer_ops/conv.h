@@ -20,8 +20,11 @@ limitations under the License.
 #include "tensorflow/lite/kernels/internal/common.h"
 #include "tensorflow/lite/kernels/internal/portable_tensor_utils.h"
 
-#include "cfu.h"
-#include "cbo.h"
+#include "lab2_api.h"
+
+extern "C" int32_t hw_simd_mac_extended(
+    int8_t *ptr1, int8_t *ptr2, int32_t input_offset, uint32_t N);
+
 namespace tflite
 {
   namespace reference_integer_ops
@@ -38,7 +41,6 @@ namespace tflite
     {
       // Get parameters.
       const int32_t input_offset = params.input_offset; // r = s(q - Z)
-      cfu_op0(1, input_offset, 0);
       const int stride_width = params.stride_width;
       const int stride_height = params.stride_height;
       const int dilation_width_factor = params.dilation_width_factor;
@@ -87,7 +89,6 @@ namespace tflite
             {
               auto group = out_channel / filters_per_group;
               int32_t acc = 0;
-              cfu_op0(0, 0, 0);
               for (int filter_y = 0; filter_y < filter_height; ++filter_y)
               {
                 const int in_y = in_y_origin + dilation_height_factor * filter_y;
@@ -104,43 +105,23 @@ namespace tflite
                   {
                     continue;
                   }
-
-                  for (int in_channel = 0; in_channel < filter_input_depth; in_channel += 4)
+                  for (int i = 0; i < filter_input_depth; i += 256)
                   {
-                    const int input_index =
-                        Offset(input_shape, batch, in_y, in_x,
-                               in_channel + group * filter_input_depth);
-                    const int filter_index =
-                        Offset(filter_shape, out_channel, filter_y, filter_x, in_channel);
-
-                    const int8_t *input_address = input_data + input_index;
-                    const int8_t *filter_address = filter_data + filter_index;
-
-                    cbo_clean(input_address);
-                    cbo_clean(filter_address);
-
-                    const uint32_t input4 = cfu_op1(0, input_address, 0);
-                    const uint32_t filter4 = cfu_op1(0, filter_address, 0);
-                    acc = static_cast<int32_t>(cfu_op0(2, input4, filter4));
-                    /* int32_t input_val = input_data[Offset(input_shape, batch, in_y, in_x, in_channel + group * filter_input_depth)];
-                    int32_t filter_val = filter_data[Offset(filter_shape, out_channel, filter_y, filter_x, in_channel)];
-                    // Accumulate with 32 bits accumulator.
-                    // In the nudging process during model quantization, we force
-                    // real value of 0.0 be represented by a quantized value. This
-                    // guarantees that the input_offset is a int8_t, even though
-                    // it is represented using int32_t. int32_t += int8_t *
-                    // (int8_t - int8_t) so the highest value we can get from each
-                    // accumulation is [-127, 127] * ([-128, 127] -
-                    // [-128, 127]), which is [-32512, 32512]. log2(32512)
-                    // = 14.98, which means we can accumulate at least 2^16
-                    // multiplications without overflow. The accumulator is
-                    // applied to a filter so the accumulation logic will hold as
-                    // long as the filter size (filter_y * filter_x * in_channel)
-                    // does not exceed 2^16, which is the case in all the models
-                    // we have seen so far.
-                    // TODO(b/174275578): Add a check to make sure the
-                    // accumulator depth is smaller than 2^16.
-                    acc += filter_val * (input_val + input_offset); */
+                    const int8_t *ptr1 = input_data + Offset(input_shape, batch, in_y, in_x, group * filter_input_depth + i);
+                    const int8_t *ptr2 = filter_data + Offset(filter_shape, out_channel, filter_y, filter_x, i);
+                    const uint32_t chunk_size = std::min(filter_input_depth - i, 256);
+                    if (input_offset == 128)
+                    {
+                      acc += hw_simd_mac_extended(
+                          const_cast<int8_t *>(ptr1), const_cast<int8_t *>(ptr2),
+                          input_offset, chunk_size);
+                    }
+                    else
+                    {
+                      acc += hw_simd_mac(
+                          const_cast<int8_t *>(ptr1), const_cast<int8_t *>(ptr2),
+                          static_cast<int8_t>(input_offset), chunk_size);
+                    }
                   }
                 }
               }
@@ -254,14 +235,10 @@ namespace tflite
                     continue;
                   }
 
-                  for (int in_channel = 0; in_channel < filter_input_depth;
-                       ++in_channel)
+                  for (int in_channel = 0; in_channel < filter_input_depth; ++in_channel)
                   {
-                    int32_t input_val =
-                        input_data[Offset(input_shape, batch, in_y, in_x,
-                                          in_channel + group * filter_input_depth)];
-                    int32_t filter_val = filter_data[Offset(
-                        filter_shape, out_channel, filter_y, filter_x, in_channel)];
+                    int32_t input_val = input_data[Offset(input_shape, batch, in_y, in_x, in_channel + group * filter_input_depth)];
+                    int32_t filter_val = filter_data[Offset(filter_shape, out_channel, filter_y, filter_x, in_channel)];
                     // Accumulate with 64 bits accumulator.
                     // int64_t += int8_t * int16_t so the highest value we can
                     // get from each accumulation is [-127, 127] * ([-32768,

@@ -74,6 +74,8 @@ module CPU(
 
     wire        cpu_invalidate;
     wire        cpu_invalid_complete;
+    wire        cpu_ifetch_hold;       // fence.i: I-cache refills wait for the D-cache writeback walk
+    wire        fe_req_rm;
 
     wire        cpu_resolve_valid;
     wire        cpu_resolve_is_branch;
@@ -103,11 +105,11 @@ module CPU(
         .inst_o           (cpu_inst_data),
         .inst_pred_taken_o(cpu_inst_pred_taken),
 
-        .rm_rdy           (ibus_rm_rdy),
+        .rm_rdy           (ibus_rm_rdy & ~cpu_ifetch_hold),
         .rm_success       (ibus_rm_success),
         .rm_complete      (ibus_rm_complete),
         .rm_data          (ibus_rm_data),
-        .req_rm           (ibus_req_rm),
+        .req_rm           (fe_req_rm),
         .rm_addr          (ibus_rm_addr)
     );
 
@@ -125,6 +127,7 @@ module CPU(
         .redirect_pc_o    (cpu_redirect_pc),
         .invalidate_o     (cpu_invalidate),
         .invalid_complete_i(cpu_invalid_complete),
+        .ifetch_hold_o    (cpu_ifetch_hold),
         .resolve_valid_o  (cpu_resolve_valid),
         .resolve_is_branch_o(cpu_resolve_is_branch),
         .resolve_is_jump_o(cpu_resolve_is_jump),
@@ -171,5 +174,7 @@ module CPU(
         .funct3_o         (npu_funct3),
         .funct7_o         (npu_funct7)
     );
+
+    assign ibus_req_rm = fe_req_rm & ~cpu_ifetch_hold;
 
 endmodule

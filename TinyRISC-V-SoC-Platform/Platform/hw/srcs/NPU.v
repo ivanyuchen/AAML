@@ -20,77 +20,70 @@
 //////////////////////////////////////////////////////////////////////////////////
 
 
-// 訊號方向以 NPU 為準：input 是外部送進來，output 是 NPU 送出去。
-// 未指定型別的 input/output 預設是 wire，可由連線或 assign 驅動。
-// reg 可在 always 區塊內賦值；是否形成暫存器，要看賦值方式。
-// 下方 posedge clk 區塊中的 state_r、NPU_out、NPU_done 會形成暫存器。
 module NPU (
-    input clk,   // 系統時脈；在上升緣更新狀態、判定 AXI 握手。
-    input rst_n, // 低電位有效的非同步 reset：0 時重設 NPU。
+    input clk,
+    input rst_n,
 
-    // CPU Interface：CPU 發出自訂指令，NPU 完成後回傳結果。
-    input      [31:0] rs1_i,   // 第一個運算元；AXI 讀/寫指令中是記憶體地址。
-    input      [31:0] rs2_i,   // 第二個運算元；AXI 寫指令中是要寫入的 32-bit 資料。
-    output reg [31:0] NPU_out, // 回傳 CPU 的結果；AXI 讀取時應放讀回的資料。
-    input             NPU_start, // CPU 提出的啟動訊號；在 IDLE 接受新指令。
-    output reg        NPU_done,  // 完成通知；目前在 DONE 狀態拉高一個 clock。
+    // CPU Interface //
+    input      [31:0] rs1_i,
+    input      [31:0] rs2_i,
+    output reg [31:0] NPU_out,
+    input             NPU_start,
+    output reg        NPU_done,
 
-    input [ 3:0] funct3_i, // 操作種類，使用 [2:0]：001=AXI 讀，010=AXI 寫。
-    input [31:0] funct7_i, // 子功能/附加參數；此介面用 32 bits 承接。
+    input [ 3:0] funct3_i,
+    input [31:0] funct7_i,
 
-    // AXI4 Master Interface：NPU 主動發起交易，透過匯流排存取記憶體。
-    // 每個 channel 都在 clock 上升緣 VALID && READY 時完成一次傳輸。
-    // 傳送方不可等 READY 才拉高 VALID；等待握手時須保持 VALID 與內容穩定。
-    // AW Channel：寫入地址，方向 NPU -> 記憶體端；與 W channel 獨立握手。
+    // AXI4 Master Interface (M_AXI) //
+    // AW Channel
     //output  [3:0] M_AXI_AWID,
-    output reg [31:0] M_AXI_AWADDR, // 要寫入的 byte 地址；本小題要求 4-byte 對齊。
-    output [7:0] M_AXI_AWLEN,      // burst 的 beat 數減 1；0 表示只傳 1 beat。
-    output [2:0] M_AXI_AWSIZE,     // 每個 beat 的 bytes = 2^AWSIZE；010 表示 4 bytes。
-    output [1:0] M_AXI_AWBURST,    // burst 地址變化方式；01=INCR，依 beat 大小遞增。
-    output M_AXI_AWLOCK,           // exclusive 存取屬性；0 表示一般存取。
-    output [3:0] M_AXI_AWCACHE,    // 此筆交易的 buffer/cache 屬性，不會自動清除 CPU cache。
-    output [2:0] M_AXI_AWPROT,     // 存取權限、安全性、指令/資料等屬性。
-    output [3:0] M_AXI_AWQOS,      // 交易服務品質/優先權提示；目前固定 0。
-    output [15:0] M_AXI_AWUSER,    // 自訂附加資訊；此範例未使用，固定 0。
-    output reg M_AXI_AWVALID,     // NPU：目前寫入地址與屬性有效。
-    input M_AXI_AWREADY,          // 記憶體端：現在可以接收寫入地址。
-    // W Channel：寫入資料，方向 NPU -> 記憶體端。
-    output reg [31:0] M_AXI_WDATA, // 要寫入的資料；共有 4 個 byte。
-    output reg [3:0] M_AXI_WSTRB,      // byte 寫入遮罩；bit 0 對應 WDATA[7:0]，1111 表示全寫。
-    output reg M_AXI_WLAST,       // 這是 burst 的最後一個 beat；單拍交易時應為 1。
-    output reg M_AXI_WVALID,      // NPU：目前 WDATA/WSTRB/WLAST 有效。
-    input M_AXI_WREADY,           // 記憶體端：現在可以接收寫入資料。
+    output reg [31:0] M_AXI_AWADDR,
+    output [7:0] M_AXI_AWLEN,
+    output [2:0] M_AXI_AWSIZE,
+    output [1:0] M_AXI_AWBURST,
+    output M_AXI_AWLOCK,
+    output [3:0] M_AXI_AWCACHE,
+    output [2:0] M_AXI_AWPROT,
+    output [3:0] M_AXI_AWQOS,
+    output [15:0] M_AXI_AWUSER,
+    output reg M_AXI_AWVALID,
+    input M_AXI_AWREADY,
+    // W Channel
+    output reg [31:0] M_AXI_WDATA,
+    output [3:0] M_AXI_WSTRB,
+    output reg M_AXI_WLAST,
+    output reg M_AXI_WVALID,
+    input M_AXI_WREADY,
 
-    // B Channel：寫入回應，方向 記憶體端 -> NPU；收到回應才算交易完成。
+    // B Channel
     //input [3:0] M_AXI_BID,
-    input [1:0] M_AXI_BRESP, // 寫入回應碼：00=OKAY，10=SLVERR，11=DECERR。
+    input [1:0] M_AXI_BRESP,
     //input [15:0] M_AXI_BUSER,
-    input M_AXI_BVALID,  // 記憶體端：目前有有效的寫入回應。
-    output M_AXI_BREADY, // NPU：可以接收寫入回應；目前固定為 1。
+    input M_AXI_BVALID,
+    output M_AXI_BREADY,
 
-    // AR Channel：讀取地址，方向 NPU -> 記憶體端。
+    // AR Channel
     //output  [3:0] M_AXI_ARID,
-    output reg [31:0] M_AXI_ARADDR, // 要讀取的 byte 地址；本小題要求 4-byte 對齊。
-    output [7:0] M_AXI_ARLEN,      // burst 的 beat 數減 1；0 表示只讀 1 beat。
-    output [2:0] M_AXI_ARSIZE,     // 每個 beat 的 bytes = 2^ARSIZE；010 表示 4 bytes。
-    output [1:0] M_AXI_ARBURST,    // burst 地址變化方式；01=INCR。
-    output M_AXI_ARLOCK,           // exclusive 存取屬性；0 表示一般存取。
-    output [3:0] M_AXI_ARCACHE,    // 讀取交易的 buffer/cache 屬性；仍須由軟體維護 cache 一致性。
-    output [2:0] M_AXI_ARPROT,     // 存取權限、安全性、指令/資料等屬性。
-    output [3:0] M_AXI_ARQOS,      // 交易服務品質/優先權提示；目前固定 0。
-    output [15:0] M_AXI_ARUSER,    // 自訂附加資訊；此範例未使用，固定 0。
-    output reg M_AXI_ARVALID,     // NPU：目前讀取地址與屬性有效。
-    input M_AXI_ARREADY,          // 記憶體端：現在可以接收讀取地址。
+    output reg [31:0] M_AXI_ARADDR,
+    output [7:0] M_AXI_ARLEN,
+    output [2:0] M_AXI_ARSIZE,
+    output [1:0] M_AXI_ARBURST,
+    output M_AXI_ARLOCK,
+    output [3:0] M_AXI_ARCACHE,
+    output [2:0] M_AXI_ARPROT,
+    output [3:0] M_AXI_ARQOS,
+    output [15:0] M_AXI_ARUSER,
+    output reg M_AXI_ARVALID,
+    input M_AXI_ARREADY,
 
-    // R Channel：讀回資料，方向 記憶體端 -> NPU。
-    input [3:0] M_AXI_RID,    // 回傳資料的交易 ID；目前範例未使用。
-    input [31:0] M_AXI_RDATA, // 記憶體讀回的 32-bit 資料；握手時才能視為接收成功。
-    input [1:0] M_AXI_RRESP,  // 讀取回應碼：00=OKAY，10=SLVERR，11=DECERR。
-    input M_AXI_RLAST,       // 記憶體端標記這是最後一個 beat；單拍交易應為 1。
-    input M_AXI_RVALID,      // 記憶體端：目前 RDATA/RRESP/RLAST 有效。
-    output M_AXI_RREADY      // NPU：現在可以接收讀回資料；目前固定為 1。
+    // R Channel
+    input [3:0] M_AXI_RID,
+    input [31:0] M_AXI_RDATA,
+    input [1:0] M_AXI_RRESP,
+    input M_AXI_RLAST,
+    input M_AXI_RVALID,
+    output M_AXI_RREADY
 );
-    // 以下 assign 持續輸出固定設定：單拍、每拍 4 bytes。
     assign M_AXI_AWLEN   = 8'h00;
     assign M_AXI_AWSIZE  = 3'b010;
     assign M_AXI_AWBURST = 2'b01;
@@ -99,9 +92,12 @@ module NPU (
     assign M_AXI_AWPROT  = 3'b000;
     assign M_AXI_AWQOS   = 4'b0000;
     assign M_AXI_AWUSER  = 16'h0000;
-    assign M_AXI_BREADY  = 1'b1;    // 回應到達時就會握手，控制邏輯須在該上升緣處理。
+    assign M_AXI_WSTRB   = 4'b1111;
+    assign M_AXI_BREADY  = 1'b1;
 
-    assign M_AXI_ARLEN   = 8'h00;
+    assign M_AXI_ARLEN   = (ptr_flag) ?
+        ((Ptr1_Burst_Ending_addr - Ptr1_Current_addr) >= 12) ? 8'h03 : (Ptr1_Burst_Ending_addr[7:0] - Ptr1_Current_addr[7:0])>>2:
+        ((Ptr2_Burst_Ending_addr - Ptr2_Current_addr) >= 12) ? 8'h03 : (Ptr2_Burst_Ending_addr[7:0] - Ptr2_Current_addr[7:0])>>2;
     assign M_AXI_ARSIZE  = 3'b010;
     assign M_AXI_ARBURST = 2'b01;
     assign M_AXI_ARLOCK  = 1'b0;
@@ -109,165 +105,245 @@ module NPU (
     assign M_AXI_ARPROT  = 3'b000;
     assign M_AXI_ARQOS   = 4'b0000;
     assign M_AXI_ARUSER  = 16'h0000;
-    assign M_AXI_RREADY  = 1'b1; // 資料到達時就會握手，控制邏輯須在該上升緣取走資料。
+    assign M_AXI_RREADY  = 1'b1;
 
-    localparam STATE_IDLE = 3'd0; // 等待 CPU 的 NPU_start。
-    localparam STATE_READ = 3'd1; // 執行 AXI 讀取。
-    localparam STATE_WRITE = 3'd2; // 分別處理 AW/W 握手，並等待 B 回應。
-    localparam STATE_SEND_ADDR = 3'd3; // 等待讀取地址握手。
-    localparam STATE_COMP = 3'd4; // 執行原本的加法範例。
-    localparam STATE_DONE = 3'd5; // 拉高 NPU_done，然後回到 IDLE。
+    localparam STATE_IDLE  = 4'd0;
+    localparam STATE_BURST = 4'd1;
+    localparam READ        = 4'd2;
+    localparam SEND_ADDR   = 4'd3;
+    localparam READ_DATA   = 4'd4;
+    localparam ADDR_ADD    = 4'd5;
+    localparam SET_INDEX   = 4'd6;
+    localparam STATE_COMP  = 4'd7;
+    localparam STATE_DONE  = 4'd8;
 
-    reg [2:0] state_r; // 保存狀態機目前狀態的 3-bit 暫存器。
+    reg [3:0] state_r;
 
-    reg signed [31:0] acc_r;
-    reg signed [31:0] offset;
-    reg stage;
-    wire misaligned_addr = (rs1_i[1:0] != 2'b00);
+    //Self defined NPU Signals
+    reg [31:0] Ptr1_Starting_addr;
+    wire [31:0] Ptr1_Ending_addr = Ptr1_Starting_addr + (N) - 1;
+    reg [31:0] Ptr2_Starting_addr;
+    wire [31:0] Ptr2_Ending_addr = Ptr2_Starting_addr + (N) - 1;
+
+    wire [31:0] Ptr1_Burst_Starting_addr = Ptr1_Starting_addr;
+    reg [31:0] Ptr1_Burst_Ending_addr;
+    wire [31:0] Ptr2_Burst_Starting_addr = Ptr2_Starting_addr;
+    reg [31:0] Ptr2_Burst_Ending_addr;
+
+    reg [31:0] Ptr1_Current_addr;
+    reg [31:0] Ptr2_Current_addr;
+
+    reg [8:0] N;
+    // Nine bits represent the public int8_t range and the extended +128 case.
+    reg signed [8:0] input_offset;
+
+    reg [7:0] ptr1_buffer [0:259];
+    reg [7:0] ptr2_buffer [0:259];
+    reg [31:0] ptr1_buffer_index;
+    reg [31:0] ptr2_buffer_index;
+    wire [31:0] ptr1_compute_start_index = {30'd0, Ptr1_Starting_addr[1:0]};
+    wire [31:0] ptr2_compute_start_index = {30'd0, Ptr2_Starting_addr[1:0]};
+    wire [31:0] ptr1_compute_end_index = ptr1_compute_start_index + N - 1;
+    wire [31:0] ptr2_compute_end_index = ptr2_compute_start_index + N - 1;
+    reg [31:0] ptr1_compute_byte;
+    reg [31:0] ptr2_compute_byte;
+    reg signed [31:0] accum;
+
+    reg [7:0] expect_beats;
+    reg [7:0] received_beats;
+    reg read_error;
+
+    wire ptr_flag = (Ptr1_Current_addr <= Ptr1_Ending_addr);
+
+    // Four parallel MAC lanes.
+    wire lane0_valid = (ptr1_compute_byte <= ptr1_compute_end_index) &&
+                       (ptr2_compute_byte <= ptr2_compute_end_index);
+    wire lane1_valid = (ptr1_compute_byte + 1 <= ptr1_compute_end_index) &&
+                       (ptr2_compute_byte + 1 <= ptr2_compute_end_index);
+    wire lane2_valid = (ptr1_compute_byte + 2 <= ptr1_compute_end_index) &&
+                       (ptr2_compute_byte + 2 <= ptr2_compute_end_index);
+    wire lane3_valid = (ptr1_compute_byte + 3 <= ptr1_compute_end_index) &&
+                       (ptr2_compute_byte + 3 <= ptr2_compute_end_index);
+
+    wire signed [8:0] lane0_input = $signed({ptr1_buffer[ptr1_compute_byte][7], ptr1_buffer[ptr1_compute_byte]}) + input_offset;
+    wire signed [8:0] lane1_input = $signed({ptr1_buffer[ptr1_compute_byte + 1][7], ptr1_buffer[ptr1_compute_byte + 1]}) + input_offset;
+    wire signed [8:0] lane2_input = $signed({ptr1_buffer[ptr1_compute_byte + 2][7], ptr1_buffer[ptr1_compute_byte + 2]}) + input_offset;
+    wire signed [8:0] lane3_input = $signed({ptr1_buffer[ptr1_compute_byte + 3][7], ptr1_buffer[ptr1_compute_byte + 3]}) + input_offset;
+
+    wire signed [7:0] lane0_filter = $signed(ptr2_buffer[ptr2_compute_byte]);
+    wire signed [7:0] lane1_filter = $signed(ptr2_buffer[ptr2_compute_byte + 1]);
+    wire signed [7:0] lane2_filter = $signed(ptr2_buffer[ptr2_compute_byte + 2]);
+    wire signed [7:0] lane3_filter = $signed(ptr2_buffer[ptr2_compute_byte + 3]);
+
+    wire signed [16:0] lane0_product = lane0_input * lane0_filter;
+    wire signed [16:0] lane1_product = lane1_input * lane1_filter;
+    wire signed [16:0] lane2_product = lane2_input * lane2_filter;
+    wire signed [16:0] lane3_product = lane3_input * lane3_filter;
+
+    wire signed [31:0] lane0_result = lane0_valid ? {{15{lane0_product[16]}}, lane0_product} : 32'sd0;
+    wire signed [31:0] lane1_result = lane1_valid ? {{15{lane1_product[16]}}, lane1_product} : 32'sd0;
+    wire signed [31:0] lane2_result = lane2_valid ? {{15{lane2_product[16]}}, lane2_product} : 32'sd0;
+    wire signed [31:0] lane3_result = lane3_valid ? {{15{lane3_product[16]}}, lane3_product} : 32'sd0;
+    wire signed [31:0] compute_sum = lane0_result + lane1_result + lane2_result + lane3_result;
+    // Instruction
+/*
+ * Lab 2 CUSTOM-0 instruction encoding
+ *
+ * opcode = 0x0B (CUSTOM-0)
+ *
+ * funct3 | funct7 | Command   | rs1  | rs2
+ * ------------------------------------------------
+ *    3   |    0   | CONFIG    | N    | input_offset
+ *    3   |    1   | LOAD_PTR1 | ptr1 | ptr2
+ *
+ */
 
 
-    // 加法範例與單拍、4-byte 對齊的 AXI 讀寫流程。
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state_r       <= STATE_IDLE;
-            NPU_out       <= 32'd0;
-            NPU_done      <= 1'b0;
+            state_r                 <= STATE_IDLE;
+            NPU_out                 <= 32'd0;
+            NPU_done                <= 1'b0;
 
-            // Reset 時取消所有地址/資料要求，並清除輸出暫存器。
-            M_AXI_AWADDR  <= 32'd0;
-            M_AXI_AWVALID <= 1'b0;
-            M_AXI_WDATA   <= 32'd0;
-            M_AXI_WLAST   <= 1'b0;
-            M_AXI_WVALID  <= 1'b0;
-            M_AXI_ARADDR  <= 32'd0;
-            M_AXI_ARVALID <= 1'b0;
-            M_AXI_WSTRB   <= 4'b1111;
-            acc_r <= 32'd0;
-            offset <= 32'd0;
+            M_AXI_AWADDR            <= 32'd0;
+            M_AXI_AWVALID           <= 1'b0;
+            M_AXI_WDATA             <= 32'd0;
+            M_AXI_WLAST             <= 1'b0;
+            M_AXI_WVALID            <= 1'b0;
+            M_AXI_ARADDR            <= 32'd0;
+            M_AXI_ARVALID           <= 1'b0;
 
-            stage <= 1'b0;
+            Ptr1_Starting_addr      <= 32'd0;
+            Ptr1_Burst_Ending_addr  <= 32'd0;
+            Ptr1_Current_addr       <= 32'd0;
+            Ptr2_Starting_addr      <= 32'd0;
+            Ptr2_Burst_Ending_addr  <= 32'd0;
+            Ptr2_Current_addr       <= 32'd0;
+            N                       <= 9'd0;
+            input_offset            <= 9'sd0;
+            ptr1_buffer_index       <= 32'd0;
+            ptr2_buffer_index       <= 32'd0;
+            ptr1_compute_byte       <= 32'd0;
+            ptr2_compute_byte       <= 32'd0;
+            accum                   <= 32'sd0;
+            expect_beats            <= 8'd0;
+            received_beats          <= 8'd0;
+            read_error              <= 1'b0;
         end else begin
             NPU_done <= 1'b0;
             case (state_r)
                 STATE_IDLE: begin
                     NPU_done <= 1'b0;
                     if (NPU_start) begin
-                        if (funct3_i[2:0] == 3'b000) begin
-                            state_r <= STATE_COMP;
-                        end
-                        else if (funct3_i[2:0] == 3'b001) begin
-                            if (misaligned_addr) begin
-                                M_AXI_ARADDR <= {rs1_i[31:2], 2'b00};
-                                M_AXI_ARVALID <= 1'b1; // 表示讀取地址有效。
-                                state_r <= STATE_SEND_ADDR;
-                            end else begin
-                                M_AXI_ARADDR <= rs1_i; // 設定要讀取的記憶體地址。
-                                M_AXI_ARVALID <= 1'b1; // 表示讀取地址有效。
-                                state_r <= STATE_SEND_ADDR;
-                            end
-                        end
-                        else if (funct3_i[2:0] == 3'b010) begin
-                            if (misaligned_addr) begin
-                                M_AXI_AWADDR  <= {rs1_i[31:2], 2'b00};
-                                M_AXI_WDATA  <= (rs2_i << rs1_i[1:0]*8);
-                                M_AXI_WSTRB   <= (4'b1111 << rs1_i[1:0]);
-                                M_AXI_WLAST   <= 1'b1; // 單拍交易，WLAST 設為 1。
-                                M_AXI_AWVALID <= 1'b1; // 表示寫入地址有效。
-                                M_AXI_WVALID  <= 1'b1; // 表示寫入資料有效
-                                state_r <= STATE_WRITE;
-                            end else begin 
-                                M_AXI_AWADDR  <= rs1_i; // 設定要寫入的記憶體地址。
-                                M_AXI_WDATA   <= rs2_i; // 設定要寫入的資料。
-                                M_AXI_WSTRB   <= 4'b1111;
-                                M_AXI_WLAST   <= 1'b1; // 單拍交易，WLAST 設為 1。
-                                M_AXI_AWVALID <= 1'b1; // 表示寫入地址有效。
-                                M_AXI_WVALID  <= 1'b1; // 表示寫入資料有效
-                                state_r <= STATE_WRITE;
-                            end
-
-                        end
-                        else begin
-                            state_r <= STATE_DONE;
-                        end
-                    end
-                end
-                STATE_READ: begin
-                    // 在此處理 AXI 讀取的握手與資料接收。
-                    // 當讀取完成後，將資料存入 NPU_out，並轉到 STATE_DONE。
-                    if (misaligned_addr) begin
-                        if (M_AXI_RVALID) begin
-                            if(stage == 1'b0) begin
-                                NPU_out <= M_AXI_RDATA >> (rs1_i[1:0] * 8);
-                                M_AXI_ARADDR <= {rs1_i[31:2] + 1'b1, 2'b00};
-                                M_AXI_ARVALID <= 1'b1; // 表示讀取地址有效。
-                                state_r <= STATE_SEND_ADDR; // 轉到完成狀態。
-                                stage   <=  1'b1;
-                            end else begin
-                                NPU_out <= NPU_out |(M_AXI_RDATA << (32 - rs1_i[1:0] * 8));
-                                stage   <= 1'b0;
+                        if (funct3_i[2:0] == 3'd3) begin
+                            if(funct7_i[6:0] == 7'd0) begin
+                                N <= rs1_i[8:0];
+                                input_offset <= $signed(rs2_i[8:0]);
                                 state_r <= STATE_DONE;
-                            end      
+
+                            end else if(funct7_i[6:0] == 7'd1) begin
+                                Ptr1_Starting_addr <= rs1_i;
+                                Ptr2_Starting_addr <= rs2_i;
+                                Ptr1_Current_addr <= {rs1_i[31:2], 2'b00};
+                                Ptr2_Current_addr <= {rs2_i[31:2], 2'b00};
+                                ptr1_buffer_index <= 32'd0;
+                                ptr2_buffer_index <= 32'd0;
+                                state_r <= STATE_BURST;
+
+                            end else begin
+                                state_r <= STATE_DONE;
+                            end
+                        end else begin
+                            state_r <= STATE_DONE;
                         end
+
+                    end
+
+                end
+                STATE_BURST: begin
+                    if(Ptr1_Current_addr > Ptr1_Ending_addr && Ptr2_Current_addr > Ptr2_Ending_addr) begin
+                        state_r <= SET_INDEX;
                     end else begin
-                        if (M_AXI_RVALID) begin
-                            NPU_out <= M_AXI_RDATA; // 將讀回的資料存入 NPU_out。
-                            state_r <= STATE_DONE; // 轉到完成狀態。
-                        end
+                        state_r <= READ;
                     end
 
+                    Ptr1_Burst_Ending_addr <= ({Ptr1_Current_addr[31:12], 12'hFFF} <= Ptr1_Ending_addr) ? {Ptr1_Burst_Starting_addr[31:12], 12'hFFF} : Ptr1_Ending_addr;
+                    Ptr2_Burst_Ending_addr <= ({Ptr2_Current_addr[31:12], 12'hFFF} <= Ptr2_Ending_addr) ? {Ptr2_Burst_Starting_addr[31:12], 12'hFFF} : Ptr2_Ending_addr;
                 end
-                STATE_WRITE: begin
-                    // AW 和 W 各自握手；收到 B 回應後才通知 CPU 完成。
-                    if(M_AXI_AWREADY && M_AXI_AWVALID) begin
-                        M_AXI_AWVALID <= 1'b0; // 地址已經被接收，取消有效訊號。
-                    end
-                    if(M_AXI_WREADY && M_AXI_WVALID) begin
-                        M_AXI_WVALID <= 1'b0; // 資料已經被接收，取消有效訊號。
-                    end
-                    if(M_AXI_BVALID && M_AXI_BREADY) begin
-                        if (!misaligned_addr) begin
-                            // Aligned write 只做一次。
-                            stage   <= 1'b0;
-                            state_r <= STATE_DONE;
-                        end
-                        else if (stage == 1'b0) begin
-                            // Misaligned 第一筆完成，發出第二筆。
-                            M_AXI_AWADDR <= {rs1_i[31:2] + 1'b1, 2'b00};
-                            M_AXI_WDATA <= rs2_i >> (32 - rs1_i[1:0] * 8);
-                            M_AXI_WSTRB <= 4'b1111 >> (4 - rs1_i[1:0]);
-                            M_AXI_WLAST   <= 1'b1;
-                            M_AXI_AWVALID <= 1'b1;
-                            M_AXI_WVALID  <= 1'b1;
-                            stage         <= 1'b1;
-                        end
-                        else begin
-                            // Misaligned 第二筆完成。
-                            stage   <= 1'b0;
-                            state_r <= STATE_DONE;
-                        end
-                    end
+                READ: begin
 
+                    state_r <= SEND_ADDR;
                 end
-                STATE_SEND_ADDR: begin
-                    // 在此處理 AXI 讀取地址的握手。
-                    // 當地址傳送完成後，轉到 STATE_READ。
-                    if (M_AXI_ARREADY) begin
-                        M_AXI_ARVALID <= 1'b0; // 地址已經被接收，取消有效訊號。
-                        state_r <= STATE_READ; // 轉到讀取狀態。
+                SEND_ADDR: begin
+                    M_AXI_ARADDR <= ptr_flag ? Ptr1_Current_addr : Ptr2_Current_addr;
+                    M_AXI_ARVALID <= 1'b1;
+                    if(M_AXI_ARREADY && M_AXI_ARVALID) begin
+                        M_AXI_ARVALID <= 1'b0;
+                        received_beats <= 8'd0;
+                        expect_beats <= M_AXI_ARLEN + 1;
+                        read_error <= 1'b0;
+                        state_r <= READ_DATA;
                     end
+                end
+                READ_DATA: begin
+                    if(M_AXI_RVALID && M_AXI_RREADY) begin
+                        if(M_AXI_RRESP != 2'b00) begin
+                            read_error <= 1'b1;
+                        end
+
+                        if(!read_error &&
+                           M_AXI_RRESP == 2'b00 &&
+                           received_beats + 1 <= expect_beats) begin
+                            if(ptr_flag) begin
+                                ptr1_buffer[ptr1_buffer_index]     <= M_AXI_RDATA[7:0];
+                                ptr1_buffer[ptr1_buffer_index + 1] <= M_AXI_RDATA[15:8];
+                                ptr1_buffer[ptr1_buffer_index + 2] <= M_AXI_RDATA[23:16];
+                                ptr1_buffer[ptr1_buffer_index + 3] <= M_AXI_RDATA[31:24];
+                                ptr1_buffer_index <= ptr1_buffer_index + 4;
+                            end else begin
+                                ptr2_buffer[ptr2_buffer_index]     <= M_AXI_RDATA[7:0];
+                                ptr2_buffer[ptr2_buffer_index + 1] <= M_AXI_RDATA[15:8];
+                                ptr2_buffer[ptr2_buffer_index + 2] <= M_AXI_RDATA[23:16];
+                                ptr2_buffer[ptr2_buffer_index + 3] <= M_AXI_RDATA[31:24];
+                                ptr2_buffer_index <= ptr2_buffer_index + 4;
+                            end
+                        end
+                        received_beats <= received_beats + 1;
+
+                        if(M_AXI_RLAST) begin
+                            if(read_error || M_AXI_RRESP != 2'b00 ||received_beats + 1 != expect_beats) begin
+                                state_r <= STATE_DONE;
+                            end else begin
+                                state_r <= ADDR_ADD;
+                            end
+                        end
+                    end
+                end
+                SET_INDEX: begin
+                    ptr1_compute_byte <= ptr1_compute_start_index;
+                    ptr2_compute_byte <= ptr2_compute_start_index;
+                    accum <= 32'd0;
+                    state_r <= STATE_COMP;
                 end
                 STATE_COMP: begin
-                    if(funct7_i == 7'b0000000) begin
-                        NPU_out <= 32'b0; // 執行加法運算。
-                        acc_r   <= 32'b0; // 清除累加器。
-                    end else if(funct7_i == 7'b0000001) begin
-                        offset <= rs1_i;
-                    end else if (funct7_i == 7'b0000010) begin
-                        acc_r   <= acc_r + mac_sum;
-                        NPU_out <= acc_r + mac_sum;
+                    accum <= accum + compute_sum;
+                    ptr1_compute_byte <= ptr1_compute_byte + 4;
+                    ptr2_compute_byte <= ptr2_compute_byte + 4;
+                    if(ptr1_compute_byte + 3 >= ptr1_compute_end_index && ptr2_compute_byte + 3 >= ptr2_compute_end_index) begin
+                        NPU_out <= accum + compute_sum;
+                        state_r <= STATE_DONE;
                     end
-                    state_r <= STATE_DONE;
                 end
+                ADDR_ADD: begin
+                    if(ptr_flag) begin
+                        Ptr1_Current_addr <= Ptr1_Current_addr + ((M_AXI_ARLEN + 1) * 4);
+                    end else begin
+                        Ptr2_Current_addr <= Ptr2_Current_addr + ((M_AXI_ARLEN + 1) * 4);
+                    end
+                    state_r <= STATE_BURST;
+                end
+
+
 
                 STATE_DONE: begin
                     NPU_done <= 1'b1;
@@ -278,19 +354,4 @@ module NPU (
             endcase
         end
     end
-
-
-integer i;
-  reg signed [31:0] mac_sum;
-
-  always @(*) begin
-      mac_sum = 32'sd0;
-
-      for (i = 0; i < 4; i = i + 1) begin
-          mac_sum = mac_sum
-              + ($signed(rs1_i[i*8 +: 8]) + offset)
-              *  $signed(rs2_i[i*8 +: 8]);
-      end
-  end
 endmodule
-

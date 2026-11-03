@@ -40,6 +40,8 @@ module dcache_pro(
 	input invalidate_i,
 	input flush_i,
 	input writeback_i,
+	input clean_all_i,       // fence.i: write back every dirty line (level, held until clean_done_o)
+	output clean_done_o,     // one-cycle pulse when the whole-cache writeback walk has finished
 	
 	// mem interface //
 	output reg [31:0] mem_addr,
@@ -129,8 +131,38 @@ module dcache_pro(
 	parameter RMEND = 4;//100
 	parameter EXC = 5;  //101
 	parameter RECOMP = 6;//110  // Recompare when miss
+	parameter CL_SCAN = 7;      // fence.i walk: look for a dirty way at walk_idx
+	parameter CL_WM = 8;        // fence.i walk: write that line to memory
+	parameter CL_WMEND = 9;     // fence.i walk: wait for the write response, then clear dirty
+	parameter CL_DONE = 10;     // fence.i walk: all 512 sets clean
 
-    reg [2:0]cs, ns;
+    reg [3:0]cs, ns;
+
+	// fence.i whole-cache writeback walk state
+	reg [8:0]walk_idx;
+	reg walk_way;
+	reg [17:0]walk_tag;
+	wire walk_dty0 = vld_0 & dty_0;
+	wire walk_dty1 = vld_1 & dty_1;
+	assign clean_done_o = (cs == CL_DONE);
+
+	always@(posedge clk or negedge rst_n)begin
+		if(!rst_n)begin
+			walk_idx <= 0;
+			walk_way <= 0;
+			walk_tag <= 0;
+		end
+		else if(cs == IDLE)
+			walk_idx <= 0;
+		else if(cs == CL_SCAN)begin
+			if(walk_dty0 | walk_dty1)begin
+				walk_way <= ~walk_dty0;
+				walk_tag <= walk_dty0 ? tag_0 : tag_1;
+			end
+			else
+				walk_idx <= walk_idx + 1;
+		end
+	end
     //reg skip_wb;
 	
 	// signal hold //
@@ -175,7 +207,9 @@ module dcache_pro(
     always@(*)begin
         ns = IDLE;
 		case(cs)
-			IDLE :  if(flush_i | writeback_i)begin
+			IDLE :  if(clean_all_i)
+						ns = CL_SCAN;
+					else if(flush_i | writeback_i)begin
 						ns = (match1 & dty_1 | match0 & dty_0) ? WM : IDLE;
 					end
 					else if(invalidate_i | hit | !comp_mode ) begin
@@ -208,6 +242,21 @@ module dcache_pro(
 			RECOMP: begin
 			            ns = IDLE;
 			        end               
+			CL_SCAN:if(walk_dty0 | walk_dty1)
+						ns = CL_WM;
+					else if(walk_idx == 9'd511)
+						ns = CL_DONE;
+					else
+						ns = CL_SCAN;
+			CL_WM : if(wm_rdy)
+						ns = CL_WMEND;
+					else
+						ns = CL_WM;
+			CL_WMEND: if(wm_complete)   // rescan the same set: the other way may be dirty too
+						ns = CL_SCAN;
+					else
+						ns = CL_WMEND;
+			CL_DONE: ns = IDLE;
 			default:ns = IDLE;
 		endcase
 	end
@@ -258,6 +307,8 @@ module dcache_pro(
 					end
 				    else if(rm_complete & ~rm_success)
 				        {exception_saf,exception_laf} = {hold_cpu_wr,~hold_cpu_wr};
+			CL_WMEND: if(wm_complete)   // clear dirty even on a failed write, so the walk always terminates
+						wr_dty = {walk_way, ~walk_way};
 			RECOMP: begin
                         //cpu_wr = {(hold_tag_i == tag_1) & hold_cpu_wr, (hold_tag_i == tag_0) & hold_cpu_wr};
                         cpu_wr = {lru & hold_cpu_wr, ~lru & hold_cpu_wr};
@@ -316,6 +367,13 @@ module dcache_pro(
 			cache_mask = 0;
 			cache_mem_data_i = rm_data;
 			cache_cpu_data_i = 0;end	
+		else if(cs == CL_SCAN || cs == CL_WM || cs == CL_WMEND)begin
+			cache_tag_i = walk_tag;
+			cache_idx_i = walk_idx;
+			cache_ofs_i = 0;
+			cache_mask = 0;
+			cache_mem_data_i = rm_data;
+			cache_cpu_data_i = 0;end
 		else if(cs == RECOMP)begin
 			cache_tag_i = hold_tag_i;
 			cache_idx_i = hold_idx_i;
@@ -351,6 +409,11 @@ module dcache_pro(
 			   //mem_addr = {lru? tag_1 : tag_0, hold_idx_i,5'd0};
 			   mem_addr = {lru? hold_tag1 : hold_tag0, hold_idx_i,5'd0};
 			end
+	   end
+	   else if(cs == CL_WM)begin
+	       wm_vld = 1;
+	       wm_data = walk_way ? mem_data_o1 : mem_data_o0;
+	       mem_addr = {walk_tag, walk_idx, 5'd0};
 	   end
 	   else if(cs == RM)begin
 	       rm_vld = 1;

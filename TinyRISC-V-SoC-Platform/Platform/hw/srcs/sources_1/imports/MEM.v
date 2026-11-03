@@ -18,7 +18,9 @@
 //
 //   fast path : EX_MEM_Reg -> dcache_pro.v            (aligned, cacheable ld/st)
 //   slow path : EX_MEM_Reg -> lsu.v -> mmu.v -> dcache_pro.v / AXI-Lite
-//               (misaligned accesses, Zicbom CMOs, fence.i, uncached addresses)
+//               (misaligned accesses, Zicbom CMOs, uncached addresses)
+//   fence.i   : EX_MEM_Reg -> dcache_pro.v clean_all walk (writes back every dirty
+//               line so the I-cache refill that follows sees the stored code)
 //
 // Both paths share dcache_pro.v's request and response wires; mem_fast_active
 // records which one the in-flight access belongs to so the response side knows
@@ -86,6 +88,8 @@ module MEM
     ,output          dcache_flush_o
     ,output          dcache_invalidate_o
     ,output          dcache_writeback_o
+    ,output          dcache_clean_all_o  // fence.i: level request, held until dcache_clean_done_i
+    ,input           dcache_clean_done_i
     ,input   [31:0]  dcache_resp_data_i
     ,input           dcache_resp_valid_i
     ,input           dcache_hit_i
@@ -150,6 +154,21 @@ wire is_misaligned = is_unaligned_half | is_unaligned_word;
 
 wire dispatch_is_fast = req_p & is_plain_ldst & is_cacheable & ~is_misaligned;
 
+// ---- fence.i: whole-D-cache writeback, handled here instead of in lsu.v ----
+wire dispatch_is_fencei = req_p & (reg_mem_ctrl_i == 4'b0110);
+
+reg fencei_active;
+always @(posedge clk_i or negedge rst_i) begin
+    if (~rst_i)
+        fencei_active <= 1'b0;
+    else if (dispatch_is_fencei)
+        fencei_active <= 1'b1;
+    else if (dcache_clean_done_i)
+        fencei_active <= 1'b0;
+end
+
+assign dcache_clean_all_o = fencei_active;
+
 // ---- slow path: LSU + MMU ------------------------------------------------
 wire [31:0] lsu_mmu_addr, lsu_mmu_data;
 wire        lsu_mmu_rd, lsu_mmu_wr;
@@ -168,7 +187,7 @@ wire        mmu_dcache_rd, mmu_dcache_wr;
 lsu u_lsu (
     .clk_i             (clk_i), .rst_i             (rst_i),
     .opcode_inst_i     (reg_inst_i), .opcode_rb_data_i  (reg_rb_data_i),
-    .opcode_valid_i    (req_p & ~dispatch_is_fast),
+    .opcode_valid_i    (req_p & ~dispatch_is_fast & ~dispatch_is_fencei),
     .ex_mem_rd_i       (reg_mem_rd_i), .ex_mem_wr_i       (reg_mem_wr_i),
     .ex_mem_ctrl_i     (reg_mem_ctrl_i), .mmu_value_i       (mmu_lsu_data),
     .ex_mem_addr_i     (reg_mem_addr_i), .ex_mem_data_wr_i  (reg_mem_data_wr_i),
@@ -282,7 +301,9 @@ always @(*) begin
 end
 
 // ---- merged completion: single source of truth for Backend_top.v ----
-assign mem_writeback_valid_o = mem_fast_active ? dcache_resp_valid_i : lsu_writeback_valid;
-assign mem_writeback_value_o = mem_fast_active ? mem_fast_value_r    : lsu_writeback_value;
+assign mem_writeback_valid_o = mem_fast_active ? dcache_resp_valid_i :
+                               fencei_active   ? dcache_clean_done_i : lsu_writeback_valid;
+assign mem_writeback_value_o = mem_fast_active ? mem_fast_value_r    :
+                               fencei_active   ? 32'b0               : lsu_writeback_value;
 
 endmodule

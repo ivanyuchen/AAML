@@ -1,0 +1,28 @@
+VCS ?= vcs
+SIM := ./simv
+TESTBENCH := TESTBENCH
+RTL_DIR := RTL
+
+.PHONY: verif1 verif2 verif3 verif4 regression run clean
+
+verif1:
+	$(MAKE) -f Makefile_vcs run MODE=0 NCASES=4 OUT=verif1
+verif2:
+	$(MAKE) -f Makefile_vcs run MODE=1 NCASES=4 OUT=verif2
+verif3:
+	$(MAKE) -f Makefile_vcs run MODE=2 NCASES=12 OUT=verif3
+verif4:
+	$(MAKE) -f Makefile_vcs run MODE=3 NCASES=12 OUT=verif4
+regression: verif1 verif2 verif3 verif4
+
+run:
+	mkdir -p $(OUT)
+	python3 data_generator.py --mode $(MODE) --target_dir $(OUT) --ncases $(NCASES) --seed 2026
+	cp $(OUT)/input.txt $(OUT)/input.bk
+	cp $(OUT)/input.txt $(TESTBENCH)/input.txt
+	$(VCS) -o simv -full64 -debug_access+all -sverilog +incdir+$(TESTBENCH)+$(RTL_DIR) $(TESTBENCH)/TESTBENCH.v +define+RTL
+	$(SIM) +access+r
+
+clean:
+	rm -rf verif1 verif2 verif3 verif4 simv simv.daidir csrc ucli.key DVEfiles dump.vcd
+	rm -f $(TESTBENCH)/input.txt

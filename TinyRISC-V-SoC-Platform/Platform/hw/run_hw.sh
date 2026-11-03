@@ -74,5 +74,58 @@ if [ "$NEEDS_SYNTH" = true ]; then
     cd "$ROOT_DIR"
 fi
 
+# New add: for convenient concern
+REPORT_DIR="$BUILD_DIR/reports"
+TIMING_RPT="$REPORT_DIR/post_route_timing_summary.rpt"
+NPU_RPT="$REPORT_DIR/post_route_utilization_npu.rpt"
+TOP_RPT="$REPORT_DIR/post_route_utilization_top.rpt"
+
+echo ""
+echo "========================================================="
+echo ">> [HW] Implementation Reports Summary"
+echo "========================================================="
+
+if [ -f "$TIMING_RPT" ]; then
+    WNS_VAL=$(awk '/WNS\(ns\)/ {getline; getline; print $1; exit}' "$TIMING_RPT")
+    echo ">> [TIMING] Worst Negative Slack (WNS): ${WNS_VAL} ns"
+    echo ">> [TIMING] Worst Path Details (Max Delay Paths):"
+    awk '
+	/Max Delay Paths/ {flag=1}
+	flag && /Source:/ {print "   " $0}
+	flag && /Destination:/ {
+		print "   " $0
+		exit
+	}
+	' "$TIMING_RPT"
+
+else
+    echo ">> [TIMING] Timing report not found at $TIMING_RPT"
+fi
+echo "---------------------------------------------------------"
+
+if [ -f "$TOP_RPT" ]; then
+    echo ">> [UTIL] Top SoC Utilization:"
+    grep -E "^\| (Slice LUTs|Slice Registers|Block RAM|DSPs)" "$TOP_RPT" | awk '{print "   " $0}' | head -n 4
+else
+    echo ">> [UTIL] Top utilization report not found at $TOP_RPT"
+fi
+echo "---------------------------------------------------------"
+
+if [ -f "$NPU_RPT" ]; then
+    echo ">> [UTIL] NPU Module Utilization:"
+    awk -F'|' '
+        $2 ~ /^[[:space:]]*inst[[:space:]]*$/ {
+            printf "   LUTs: %s, FFs: %s, RAMB36: %s, RAMB18: %s, DSP: %s\n",
+                   $4, $8, $9, $10, $11
+            exit
+        }
+    ' "$NPU_RPT"
+else
+    echo ">> [UTIL] NPU utilization report not found at $NPU_RPT"
+fi
+
+echo "========================================================="
+echo ""
+
 echo ">> [HW] Programming FPGA with $BIT_FINAL..."
 vivado -mode batch -source "$HW_DIR/program.tcl" -notrace -tclargs "$BIT_FINAL"
