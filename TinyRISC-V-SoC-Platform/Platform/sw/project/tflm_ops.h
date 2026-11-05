@@ -3,7 +3,7 @@
 
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
 
-constexpr int kTflmResolverOpCount = 17;
+constexpr int kTflmResolverOpCount = 9;
 using ProjectOpResolver = tflite::MicroMutableOpResolver<kTflmResolverOpCount>;
 
 void tflm_register_project_ops(ProjectOpResolver* resolver);
