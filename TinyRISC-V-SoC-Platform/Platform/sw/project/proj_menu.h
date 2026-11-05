@@ -1,6 +1,0 @@
-#ifndef PLATFORM_SW_PROJECT_PROJ_MENU_H_
-#define PLATFORM_SW_PROJECT_PROJ_MENU_H_
-
-void lab_menu_run(void);
-
-#endif  // PLATFORM_SW_PROJECT_PROJ_MENU_H_

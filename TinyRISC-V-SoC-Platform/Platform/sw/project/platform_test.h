@@ -1,6 +1,0 @@
-#ifndef PLATFORM_SW_PROJECT_PLATFORM_TEST_H_
-#define PLATFORM_SW_PROJECT_PLATFORM_TEST_H_
-
-void platform_test(void);
-
-#endif  // PLATFORM_SW_PROJECT_PLATFORM_TEST_H_
