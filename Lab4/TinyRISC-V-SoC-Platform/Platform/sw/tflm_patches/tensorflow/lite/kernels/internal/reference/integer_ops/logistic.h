@@ -19,6 +19,7 @@ limitations under the License.
 #include <limits>
 
 #include "tensorflow/lite/kernels/internal/common.h"
+#include "cfu.h"
 #include "perf.h"
 
 namespace tflite {
@@ -51,8 +52,8 @@ inline void Logistic(int32_t input_zero_point, int32_t input_range_radius,
       output_data[i] = kMaxInt8;
     } else {
       const int32_t input_in_q4 = MultiplyByQuantizedMultiplier(input, input_multiplier, input_left_shift);
-      using FixedPoint4 = gemmlowp::FixedPoint<int32_t, kInputIntegerBits>;
-      const int32_t output_in_q0 = gemmlowp::logistic(FixedPoint4::FromRaw(input_in_q4)).raw();
+      // NPU LOGISTIC (funct3 = 4): rs1 = Q4.27 raw input, result = Q0.31 raw.
+      const int32_t output_in_q0 = static_cast<int32_t>(cfu_op4(0, input_in_q4, 0));
 
       // Rescale and downcast.
       using gemmlowp::RoundingDivideByPOT;
