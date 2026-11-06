@@ -254,11 +254,12 @@ module NPU (
 
 
 
+    wire logistic_done;
     wire signed [31:0] logistic_result;
     Logistic u_logistic (
         .clk(clk), .rst_n(rst_n),
         .input_a(rs1_i),
-        .done(),
+        .done(logistic_done),
         .result(logistic_result)
     );
 
@@ -297,6 +298,7 @@ module NPU (
                                 default: next_state = STATE_DONE;
                             endcase
                         end
+                        3'd4: next_state = LOGISTIC;          // Lab4 logistic
                         default: next_state = STATE_DONE;
                     endcase
                 end
@@ -318,6 +320,7 @@ module NPU (
             end
             L1_COMP:   next_state = STATE_DONE;
             STATE_ADD: next_state = STATE_DONE;
+            LOGISTIC:  if (logistic_done) next_state = STATE_DONE;
 
             // ---- Lab2 burst read + MAC ----
             STATE_BURST: begin
