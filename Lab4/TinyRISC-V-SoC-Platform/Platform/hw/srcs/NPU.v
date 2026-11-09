@@ -153,6 +153,8 @@ module NPU (
   localparam S_TR_LOAD = 4'd8;  // funct3=6 DDR -> buf_a
   localparam S_TR_PERM = 4'd9;  //          buf_a -> buf_b
   localparam S_TR_STORE = 4'd10;  //          buf_b -> DDR
+  localparam S_L1_ACC = 4'd11;  // funct3=0 MAC_ACC4: acc += registered mac_sum
+  localparam S_L1_SUM = 4'd12;  // funct3=0 MAC_ACC4: products -> mac_sum_r
 
   reg [3:0] state_r, next_state;
 
@@ -342,13 +344,20 @@ module NPU (
   //============================================================================
   // Lab1: MAC + single AXI read / write
   //============================================================================
+  // MAC_ACC4 is pipelined (one cycle was too long at 81 MHz):
+  //   start: rs1/rs2 registered -> S_L1_COMP: 4 products registered
+  //   -> S_L1_SUM: adder tree into mac_sum_r -> S_L1_ACC: acc += mac_sum_r
   reg signed [31:0] acc_r;
   reg signed [31:0] offset;
+  reg        [31:0] l1_a_bytes;
+  reg        [31:0] l1_b_bytes;
+  reg signed [31:0] mac_sum_r;
   wire signed [31:0] mac_sum;
   NPU_mac4_simd u_mac4_simd (
+      .clk    (clk),
       .offset (offset),
-      .a_bytes(rs1_i),
-      .b_bytes(rs2_i),
+      .a_bytes(l1_a_bytes),
+      .b_bytes(l1_b_bytes),
       .sum    (mac_sum)
   );
 
@@ -483,7 +492,9 @@ module NPU (
           else next_state = S_DONE;  // CONFIG / TRANSPOSE_CFG / bad start / no-op
         end
       end
-      S_ADD, S_L1_COMP: next_state = S_DONE;
+      S_L1_COMP: next_state = op_mac_acc4 ? S_L1_SUM : S_DONE;
+      S_L1_SUM: next_state = S_L1_ACC;
+      S_ADD, S_L1_ACC: next_state = S_DONE;
       S_L1_AXI, S_CONV_LOAD: if (axi_cmd_done) next_state = S_DONE;
       S_CONV_COMP: if (N == 0 || (p2_valid && p2_last)) next_state = S_DONE;
       S_LOGISTIC: if (logistic_done) next_state = S_DONE;
@@ -504,6 +515,9 @@ module NPU (
       NPU_done            <= 1'b0;
       acc_r               <= 32'sd0;
       offset              <= 32'sd0;
+      l1_a_bytes          <= 32'd0;
+      l1_b_bytes          <= 32'd0;
+      mac_sum_r           <= 32'sd0;
       N                   <= 9'd0;
       input_offset        <= 9'sd0;
       ptr1_byte_off       <= 2'd0;
@@ -544,6 +558,8 @@ module NPU (
           p2_valid      <= 1'b0;
           p2_last       <= 1'b0;
           accum         <= 32'sd0;
+          l1_a_bytes    <= rs1_i;
+          l1_b_bytes    <= rs2_i;
           if (NPU_start) begin
             if (op_axi_read) begin
               axi_cmd_start <= 1'b1;
@@ -594,10 +610,14 @@ module NPU (
             acc_r   <= 32'b0;
           end else if (op_mac_set_offset) begin
             offset <= rs1_i;
-          end else if (op_mac_acc4) begin
-            acc_r   <= acc_r + mac_sum;
-            NPU_out <= acc_r + mac_sum;
           end
+        end
+
+        S_L1_SUM: mac_sum_r <= mac_sum;
+
+        S_L1_ACC: begin
+          acc_r   <= acc_r + mac_sum_r;
+          NPU_out <= acc_r + mac_sum_r;
         end
 
         S_ADD: NPU_out <= rs1_i + rs2_i + funct7_i;

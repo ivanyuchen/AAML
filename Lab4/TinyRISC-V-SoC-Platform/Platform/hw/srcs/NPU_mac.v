@@ -1,24 +1,31 @@
 `timescale 1ns / 1ps
 //////////////////////////////////////////////////////////////////////////////////
-// MAC datapaths used by NPU.v (pure combinational, no state).
+// MAC datapaths used by NPU.v.
 //   NPU_mac4_simd  : Lab1  funct3=0, funct7=2   4 bytes of rs1/rs2 -> one sum
+//                    (products registered: sum is valid 1 cycle after inputs)
 //   NPU_mac4_lanes : Lab2  funct3=3, funct7=3   4 lanes with per-lane valid
+//                    (pure combinational)
 //////////////////////////////////////////////////////////////////////////////////
 
 // Lab1: sum_{i=0..3} (rs1.byte[i] + offset) * rs2.byte[i]
+// The 4 products are registered, then summed combinationally: one cycle
+// for (byte + offset) * byte, a second (in the caller) for the adder tree.
 module NPU_mac4_simd (
+    input                clk,
     input  signed [31:0] offset,
     input         [31:0] a_bytes,   // rs1: 4 signed int8 (input)
     input         [31:0] b_bytes,   // rs2: 4 signed int8 (filter)
     output reg signed [31:0] sum
 );
+    reg signed [31:0] product [0:3];
     integer i;
+    always @(posedge clk) begin
+        for (i = 0; i < 4; i = i + 1)
+            product[i] <= ($signed(a_bytes[i*8 +: 8]) + offset) * $signed(b_bytes[i*8 +: 8]);
+    end
     always @(*) begin
         sum = 32'sd0;
-        for (i = 0; i < 4; i = i + 1) begin
-            sum = sum + ($signed(a_bytes[i*8 +: 8]) + offset)
-                      *  $signed(b_bytes[i*8 +: 8]);
-        end
+        for (i = 0; i < 4; i = i + 1) sum = sum + product[i];
     end
 endmodule
 

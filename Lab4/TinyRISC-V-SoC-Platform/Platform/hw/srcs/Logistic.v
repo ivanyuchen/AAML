@@ -1,4 +1,6 @@
-module Logistic(
+module Logistic #(
+    parameter MUL_LAT = 2   // product registers per multiply (see Pipeline below)
+) (
     input clk,
     input rst_n,
 
@@ -88,111 +90,164 @@ function signed [31:0] rounding_half_sum(input signed [31:0] a, input signed [31
 endfunction
 
 //==============================================================================
-// Pipeline. One 32x32 multiply (saturating_rounding_doubling_high_mul) per stage at most, so each stage is short.
-//   stage 0       input register                      (above)
-//   stage 1       x2
-//   stage 2       x3, x4
-//   stage 3       (x4/4 + x3) * 1/3
-//   stage 4       x + poly_rest
-//   stage 5       exp_mod  (exp of the small part)
-//   stage 6..11   barrel shifter, one exp(-2^E) factor per stage
-//   stage 12      half_denominator
-//   stage 13      first estimate of 1/half_denominator
-//   stage 14..19  3 Newton-Raphson steps, 2 stages each
-//   stage 20      sign / zero select -> result
-// Everything is aligned: the value in stage k belongs to the same input as stage k-1 had
-// one clock earlier. Total latency from input_a to result: PIPELINE_LATENCY clocks.
+// Pipeline (81 MHz ui_clk = 12.3 ns, too short for a 32x32 multiply plus its
+// rounding and the surrounding adds in one cycle).
+//
+// Every multiply goes through Logistic_mul: MUL_LAT product registers, which
+// Vivado packs into the DSP48 M/P registers. A "step" = multiply + post-op:
+//   inputs registered at T  ->  product at T + MUL_LAT  ->  post-op result
+//   registered at T + STEP  (STEP = MUL_LAT + 1)
+// Values not consumed by a step ride along in *_at[T] shift registers, where
+// the index is the cycle (counted from a_stage0 = 0) the value belongs to.
+//
+//   T = 1                x, remainder bits, sign            (from a_stage0)
+//   step  1              x2 = x*x
+//   step  2              x3 = x2*x, x4 = x2*x2  ->  x4/4 + x3
+//   step  3              (x4/4 + x3) * 1/3      ->  poly = x + (.. + x2)/2
+//   step  4              exp_mod = c + c*poly
+//   steps 5..10          barrel shifter, one exp(-2^E) factor per step
+//   +1 cycle             half_denominator = (e + 1) / 2
+//   step 11              x0 = 48/17 - 32/17 * half_denominator
+//   steps 12..17         3 Newton-Raphson iterations, 2 steps each
+//   +1 cycle             sign / zero select -> result
+// Bit-exact with the single-cycle-per-stage version (same ops, same order).
 //==============================================================================
-localparam PIPELINE_LATENCY = 21;
+localparam STEP    = MUL_LAT + 1;
 
-// values carried along the pipeline (aligned to their stage index)
-reg signed [31:0] remainder_pipe [1:10];
-reg        [1:0]  sign_pipe      [1:19];      // {a_is_zero, a_is_positive}
+localparam T_X     = 1;                       // x, remainder, sign
+localparam T_X2    = T_X + STEP;              // x2
+localparam T_S3    = T_X2 + STEP;             // x4/4 + x3
+localparam T_POLY  = T_S3 + STEP;             // poly
+localparam T_E0    = T_POLY + STEP;           // exp_mod
+localparam T_E6    = T_E0 + 6 * STEP;         // exp(-|a|)
+localparam T_HD    = T_E6 + 1;                // half_denominator
+localparam T_XR0   = T_HD + STEP;             // first estimate of 1/half_den
+localparam T_XR3   = T_XR0 + 6 * STEP;        // after 3 Newton-Raphson steps
+localparam T_RES   = T_XR3 + 1;               // result register
+localparam PIPELINE_LATENCY = T_RES + 1;      // + the a_stage0 input register
 
-// exp(a_mod_quarter_minus_one_quarter) = exp(-1/8) * (1 + x + x^2/2 + x^3/6 + x^4/24), same op order as gemmlowp
-reg signed [31:0] x_stage1, x2_stage1;
-reg signed [31:0] x_stage2, x2_stage2, x3_stage2, x4_stage2;
-reg signed [31:0] x_stage3, x2_stage3, x4_over_4_plus_x3_times_constant_1_over_3_stage3;
-reg signed [31:0] x_plus_x4_over_24_plus_x3_over_6_plus_x2_over_2_stage4;
+// ---- T = 1 ----
+reg signed [31:0] x_at   [T_X:T_S3+MUL_LAT];
+reg        [ 5:0] rem_at [T_X:T_E6-1];       // remainder bits [30:25]
+reg        [ 1:0] sign_at[T_X:T_RES-1];      // {a_is_zero, a_is_positive}
 
-// exp(-|a|) after each barrel stage; exp_result_pipe[5] = exp_mod, exp_result_pipe[11] = exp_on_negative_values
-reg signed [31:0] exp_result_pipe [5:11];
+// ---- step 1: x2 ----
+wire signed [31:0] x2_y;
+Logistic_mul #(.LAT(MUL_LAT)) u_mul_x2 (.clk(clk), .a(x_at[T_X]), .b(x_at[T_X]), .y(x2_y));
+reg signed [31:0] x2_at [T_X2:T_S3+MUL_LAT];
 
-// 1/(1+e) Newton-Raphson
-reg signed [31:0] half_denominator_pipe         [12:19];
-reg signed [31:0] x_reciprocal_pipe                  [13:19];
-reg signed [31:0] half_denominator_times_x_pipe [14:18];
+// ---- step 2: x3, x4 ----
+wire signed [31:0] x3_y, x4_y;
+Logistic_mul #(.LAT(MUL_LAT)) u_mul_x3 (.clk(clk), .a(x2_at[T_X2]), .b(x_at[T_X2]),  .y(x3_y));
+Logistic_mul #(.LAT(MUL_LAT)) u_mul_x4 (.clk(clk), .a(x2_at[T_X2]), .b(x2_at[T_X2]), .y(x4_y));
+reg signed [31:0] x4_over_4_plus_x3;          // valid at T_S3
 
-wire signed [31:0] result_if_positive = saturating_rounding_multiply_by_pot(x_reciprocal_pipe[19], 1);   // 1 / (1 + e), Q0.31
+// ---- step 3: (x4/4 + x3) * 1/3, poly ----
+wire signed [31:0] s3_y;
+Logistic_mul #(.LAT(MUL_LAT)) u_mul_s3 (.clk(clk), .a(x4_over_4_plus_x3), .b(constant_1_over_3), .y(s3_y));
+reg signed [31:0] x_plus_x4_over_24_plus_x3_over_6_plus_x2_over_2;  // valid at T_POLY
+
+// ---- step 4: exp_mod, steps 5..10: barrel shifter ----
+wire signed [31:0] e0_y;
+Logistic_mul #(.LAT(MUL_LAT)) u_mul_e0 (.clk(clk), .a(constant_term),
+                                        .b(x_plus_x4_over_24_plus_x3_over_6_plus_x2_over_2), .y(e0_y));
+reg  signed [31:0] exp_at [T_E0:T_E6];
+wire signed [31:0] exp_next [1:6];            // result of barrel step j
+
+function signed [31:0] barrel_constant(input integer j);
+    case (j)
+        1: barrel_constant = exp_of_neg_1_over_4;
+        2: barrel_constant = exp_of_neg_1_over_2;
+        3: barrel_constant = exp_of_neg_1;
+        4: barrel_constant = exp_of_neg_2;
+        5: barrel_constant = exp_of_neg_4;
+        default: barrel_constant = exp_of_neg_8;
+    endcase
+endfunction
+
+genvar g;
+generate
+    for (g = 1; g <= 6; g = g + 1) begin : g_barrel
+        localparam T_IN = T_E0 + (g - 1) * STEP;
+        wire signed [31:0] y;
+        Logistic_mul #(.LAT(MUL_LAT)) u_mul (.clk(clk), .a(exp_at[T_IN]), .b(barrel_constant(g)), .y(y));
+        // remainder bit 24+g selects exp(-2^(g-3))
+        assign exp_next[g] = rem_at[T_IN+MUL_LAT][g-1] ? y : exp_at[T_IN+MUL_LAT];
+    end
+endgenerate
+
+// ---- 1 / (1 + e) ----
+reg  signed [31:0] half_denominator_at [T_HD:T_XR0+4*STEP];
+wire signed [31:0] xr0_y;
+Logistic_mul #(.LAT(MUL_LAT)) u_mul_xr0 (.clk(clk), .a(half_denominator_at[T_HD]),
+                                         .b(constant_neg_32_over_17), .y(xr0_y));
+reg  signed [31:0] x_reciprocal_at [T_XR0:T_XR3];
+wire signed [31:0] x_reciprocal_next [1:3];
+
+// Newton-Raphson iteration n: step A at T_A: half_den * x -> 1 - half_den * x
+//                             step B at T_A + STEP: x + 4 * x * (1 - half_den * x)
+generate
+    for (g = 1; g <= 3; g = g + 1) begin : g_newton
+        localparam T_A = T_XR0 + (g - 1) * 2 * STEP;
+        localparam T_B = T_A + STEP;
+        wire signed [31:0] hx_y, step_y;
+        reg  signed [31:0] one_minus_half_denominator_times_x;   // valid at T_B
+        Logistic_mul #(.LAT(MUL_LAT)) u_mul_a (.clk(clk), .a(half_denominator_at[T_A]),
+                                               .b(x_reciprocal_at[T_A]), .y(hx_y));
+        always @(posedge clk) one_minus_half_denominator_times_x <= F2_ONE - hx_y;
+        Logistic_mul #(.LAT(MUL_LAT)) u_mul_b (.clk(clk), .a(x_reciprocal_at[T_B]),
+                                               .b(one_minus_half_denominator_times_x), .y(step_y));
+        assign x_reciprocal_next[g] = x_reciprocal_at[T_B+MUL_LAT]
+                                    + saturating_rounding_multiply_by_pot(step_y, 2);
+    end
+endgenerate
+
+wire signed [31:0] result_if_positive = saturating_rounding_multiply_by_pot(x_reciprocal_at[T_XR3], 1);   // 1 / (1 + e), Q0.31
 wire signed [31:0] result_if_negative = 32'sh7fffffff - result_if_positive;
-reg  signed [31:0] result_stage20;
+reg  signed [31:0] result_stage;
 
-integer pipeline_index;
+integer k;
 always @(posedge clk) begin
-    // ---- carried values ----
-    remainder_pipe[1] <= remainder;
-    sign_pipe[1]      <= {(a == 0), (a > 0)};
-    for (pipeline_index = 2; pipeline_index <= 10; pipeline_index = pipeline_index + 1) remainder_pipe[pipeline_index] <= remainder_pipe[pipeline_index - 1];
-    for (pipeline_index = 2; pipeline_index <= 19; pipeline_index = pipeline_index + 1) sign_pipe[pipeline_index]      <= sign_pipe[pipeline_index - 1];
+    // ---- T = 1 ----
+    x_at[T_X]    <= x;
+    rem_at[T_X]  <= remainder[30:25];
+    sign_at[T_X] <= {(a == 0), (a > 0)};
+    for (k = T_X + 1; k <= T_S3 + MUL_LAT; k = k + 1) x_at[k]    <= x_at[k-1];
+    for (k = T_X + 1; k <= T_E6 - 1;       k = k + 1) rem_at[k]  <= rem_at[k-1];
+    for (k = T_X + 1; k <= T_RES - 1;      k = k + 1) sign_at[k] <= sign_at[k-1];
 
-    // ---- stage 1..5: exp of the small part ----
-    x_stage1  <= x;
-    x2_stage1 <= saturating_rounding_doubling_high_mul(x, x);
+    // ---- step 1..3 ----
+    x2_at[T_X2] <= x2_y;
+    for (k = T_X2 + 1; k <= T_S3 + MUL_LAT; k = k + 1) x2_at[k] <= x2_at[k-1];
 
-    x_stage2  <= x_stage1;
-    x2_stage2 <= x2_stage1;
-    x3_stage2 <= saturating_rounding_doubling_high_mul(x2_stage1, x_stage1);
-    x4_stage2 <= saturating_rounding_doubling_high_mul(x2_stage1, x2_stage1);
-
-    x_stage3  <= x_stage2;
-    x2_stage3 <= x2_stage2;
-    x4_over_4_plus_x3_times_constant_1_over_3_stage3 <= saturating_rounding_doubling_high_mul(rounding_divide_by_pot(x4_stage2, 2) + x3_stage2, constant_1_over_3);
+    x4_over_4_plus_x3 <= rounding_divide_by_pot(x4_y, 2) + x3_y;
 
     // poly_rest = x^2/2 + x^3/6 + x^4/24
-    x_plus_x4_over_24_plus_x3_over_6_plus_x2_over_2_stage4 <= x_stage3 + rounding_divide_by_pot(x4_over_4_plus_x3_times_constant_1_over_3_stage3 + x2_stage3, 1);
+    x_plus_x4_over_24_plus_x3_over_6_plus_x2_over_2 <=
+        x_at[T_S3+MUL_LAT] + rounding_divide_by_pot(s3_y + x2_at[T_S3+MUL_LAT], 1);
 
-    exp_result_pipe[5] <= constant_term
-                   + saturating_rounding_doubling_high_mul(constant_term, x_plus_x4_over_24_plus_x3_over_6_plus_x2_over_2_stage4);
+    // ---- step 4..10: exp(-|a|) ----
+    exp_at[T_E0] <= constant_term + e0_y;
+    for (k = T_E0 + 1; k <= T_E6; k = k + 1) exp_at[k] <= exp_at[k-1];
+    for (k = 1; k <= 6; k = k + 1) exp_at[T_E0 + k * STEP] <= exp_next[k];
 
-    // ---- stage 6..11: barrel shifter (bit 25 = 1/4, 26 = 1/2, 27 = 1, 28 = 2, 29 = 4, 30 = 8) ----
-    exp_result_pipe[6]  <= remainder_pipe[5][25]  ? saturating_rounding_doubling_high_mul(exp_result_pipe[5],  exp_of_neg_1_over_4) : exp_result_pipe[5];
-    exp_result_pipe[7]  <= remainder_pipe[6][26]  ? saturating_rounding_doubling_high_mul(exp_result_pipe[6],  exp_of_neg_1_over_2) : exp_result_pipe[6];
-    exp_result_pipe[8]  <= remainder_pipe[7][27]  ? saturating_rounding_doubling_high_mul(exp_result_pipe[7],  exp_of_neg_1)   : exp_result_pipe[7];
-    exp_result_pipe[9]  <= remainder_pipe[8][28]  ? saturating_rounding_doubling_high_mul(exp_result_pipe[8],  exp_of_neg_2)   : exp_result_pipe[8];
-    exp_result_pipe[10] <= remainder_pipe[9][29]  ? saturating_rounding_doubling_high_mul(exp_result_pipe[9],  exp_of_neg_4)   : exp_result_pipe[9];
-    exp_result_pipe[11] <= remainder_pipe[10][30] ? saturating_rounding_doubling_high_mul(exp_result_pipe[10], exp_of_neg_8)   : exp_result_pipe[10];
-
-    // ---- stage 12..19: 1 / (1 + e) ----
-    half_denominator_pipe[12] <= rounding_half_sum(exp_result_pipe[11], 32'sh7fffffff);        // (e + 1) / 2
-    for (pipeline_index = 13; pipeline_index <= 19; pipeline_index = pipeline_index + 1)
-        half_denominator_pipe[pipeline_index] <= half_denominator_pipe[pipeline_index - 1];
+    // ---- 1 / (1 + e) ----
+    half_denominator_at[T_HD] <= rounding_half_sum(exp_at[T_E6], 32'sh7fffffff);   // (e + 1) / 2
+    for (k = T_HD + 1; k <= T_XR0 + 4 * STEP; k = k + 1)
+        half_denominator_at[k] <= half_denominator_at[k-1];
 
     // initial estimate: x = 48/17 - 32/17 * half_denominator
-    x_reciprocal_pipe[13] <= constant_48_over_17 + saturating_rounding_doubling_high_mul(half_denominator_pipe[12], constant_neg_32_over_17);
+    x_reciprocal_at[T_XR0] <= constant_48_over_17 + xr0_y;
+    for (k = T_XR0 + 1; k <= T_XR3; k = k + 1) x_reciprocal_at[k] <= x_reciprocal_at[k-1];
+    for (k = 1; k <= 3; k = k + 1) x_reciprocal_at[T_XR0 + k * 2 * STEP] <= x_reciprocal_next[k];
 
-    // 3 Newton-Raphson steps: x = x + x * (1 - half_denominator * x), 2 stages per step
-    half_denominator_times_x_pipe[14] <= saturating_rounding_doubling_high_mul(half_denominator_pipe[13], x_reciprocal_pipe[13]);
-    x_reciprocal_pipe[14] <= x_reciprocal_pipe[13];
-    x_reciprocal_pipe[15] <= x_reciprocal_pipe[14]
-                        + saturating_rounding_multiply_by_pot(saturating_rounding_doubling_high_mul(x_reciprocal_pipe[14], F2_ONE - half_denominator_times_x_pipe[14]), 2);
-
-    half_denominator_times_x_pipe[16] <= saturating_rounding_doubling_high_mul(half_denominator_pipe[15], x_reciprocal_pipe[15]);
-    x_reciprocal_pipe[16]                  <= x_reciprocal_pipe[15];
-    x_reciprocal_pipe[17] <= x_reciprocal_pipe[16]
-                        + saturating_rounding_multiply_by_pot(saturating_rounding_doubling_high_mul(x_reciprocal_pipe[16], F2_ONE - half_denominator_times_x_pipe[16]), 2);
-
-    half_denominator_times_x_pipe[18] <= saturating_rounding_doubling_high_mul(half_denominator_pipe[17], x_reciprocal_pipe[17]);
-    x_reciprocal_pipe[18]                  <= x_reciprocal_pipe[17];
-    x_reciprocal_pipe[19] <= x_reciprocal_pipe[18]
-                        + saturating_rounding_multiply_by_pot(saturating_rounding_doubling_high_mul(x_reciprocal_pipe[18], F2_ONE - half_denominator_times_x_pipe[18]), 2);
-
-    // ---- stage 20: sigmoid(a): a > 0 -> result_if_positive ; a < 0 -> 1 - result_if_positive ; a == 0 -> 0.5 ----
-    result_stage20 <= sign_pipe[19][1] ? (32'sd1 << 30)
-                : sign_pipe[19][0] ? result_if_positive
-                :                    result_if_negative;
+    // ---- sigmoid(a): a > 0 -> result_if_positive ; a < 0 -> 1 - result_if_positive ; a == 0 -> 0.5 ----
+    result_stage <= sign_at[T_RES-1][1] ? (32'sd1 << 30)
+                  : sign_at[T_RES-1][0] ? result_if_positive
+                  :                       result_if_negative;
 end
 
-assign result = result_stage20;
+assign result = result_stage;
 
 //==============================================================================
 // done: the result is valid once input_a has been stable for PIPELINE_LATENCY clocks.
@@ -200,20 +255,45 @@ assign result = result_stage20;
 //  If the same value is presented again, the pipeline already holds its result.)
 //==============================================================================
 reg [31:0] previous_input_a;
-reg [4:0]  stable_cycle_count;
+reg [6:0]  stable_cycle_count;
 wire       input_a_changed = (input_a != previous_input_a);
 
 always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
         previous_input_a <= 32'd0;
-        stable_cycle_count   <= 5'd0;
+        stable_cycle_count   <= 7'd0;
     end else begin
         previous_input_a <= input_a;
-        if (input_a_changed) stable_cycle_count <= 5'd0;
-        else if (stable_cycle_count != PIPELINE_LATENCY - 1) stable_cycle_count <= stable_cycle_count + 5'd1;
+        if (input_a_changed) stable_cycle_count <= 7'd0;
+        else if (stable_cycle_count != PIPELINE_LATENCY - 1) stable_cycle_count <= stable_cycle_count + 7'd1;
     end
 end
 
 assign done = !input_a_changed && (stable_cycle_count == PIPELINE_LATENCY - 1);
 
+endmodule
+
+
+//==============================================================================
+// Logistic_mul: y = SaturatingRoundingDoublingHighMul(a, b), same rounding as
+// the saturating_rounding_doubling_high_mul function above, LAT cycles after
+// a / b. The product registers have no reset so Vivado can pack them into
+// the DSP48 pipeline (M / P registers).
+//==============================================================================
+module Logistic_mul #(
+    parameter LAT = 2
+) (
+    input                clk,
+    input  signed [31:0] a,
+    input  signed [31:0] b,
+    output signed [31:0] y
+);
+    reg signed [63:0] product [1:LAT];
+    integer k;
+    always @(posedge clk) begin
+        product[1] <= a * b;
+        for (k = 2; k <= LAT; k = k + 1) product[k] <= product[k-1];
+    end
+    wire signed [63:0] rounded = product[LAT] + (64'sd1 << 30);
+    assign y = rounded[62:31];   // (a*b + 2^30) >>> 31, low 32 bits
 endmodule
