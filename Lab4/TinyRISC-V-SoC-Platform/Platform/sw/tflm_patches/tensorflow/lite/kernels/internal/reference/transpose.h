@@ -20,6 +20,7 @@ limitations under the License.
 #include "tensorflow/lite/kernels/internal/types.h"
 #include "perf.h"
 #include "cfu.h"
+#include "cbo.h"
 #include <stdio.h>
 
 namespace tflite
@@ -184,6 +185,94 @@ namespace tflite
         }
       }
 
+      //------------------------------------------------------------------------
+      // NPU transpose (CUSTOM-0 funct3 = 5 config, funct3 = 6 start).
+      // The NPU loads the whole input into an on-chip buffer, permutes it byte
+      // by byte, then burst-writes the output, so the CPU never touches the
+      // tensor data. Limits come from the hardware (see NPU.v / Transpose.v).
+      //------------------------------------------------------------------------
+      constexpr uintptr_t kCacheLineBytes = 32;
+      constexpr uint32_t kNpuTransposeMaxBytes = 16384; // NPU TR_BUF_BYTES
+      constexpr int kNpuTransposeMaxRank = 6;           // Transpose MAX_RANK
+
+      // funct7 of funct3 = 5. Must be plain macros: cfu_op5 stringifies
+      // funct7 into the .insn assembler line.
+#define NPU_TR_CFG_ADDR 0       // rs1 = src base, rs2 = dst base
+#define NPU_TR_CFG_SIZE 1       // rs1 = rank,     rs2 = total bytes
+#define NPU_TR_CFG_DST_SHAPE 2  // rs1 = dim d,    rs2 = output_shape[d]
+#define NPU_TR_CFG_SRC_STRIDE 3 // rs1 = dim d,    rs2 = byte stride of input
+                                //                 along output dim d
+
+      inline void CleanCacheRange(const void *ptr, uint32_t bytes)
+      {
+        uintptr_t line = reinterpret_cast<uintptr_t>(ptr) & ~(kCacheLineBytes - 1);
+        const uintptr_t end = reinterpret_cast<uintptr_t>(ptr) + bytes;
+        for (; line < end; line += kCacheLineBytes)
+          cbo_clean(reinterpret_cast<const void *>(line));
+      }
+
+      inline void InvalidateCacheRange(const void *ptr, uint32_t bytes)
+      {
+        uintptr_t line = reinterpret_cast<uintptr_t>(ptr) & ~(kCacheLineBytes - 1);
+        const uintptr_t end = reinterpret_cast<uintptr_t>(ptr) + bytes;
+        for (; line < end; line += kCacheLineBytes)
+          cbo_invalidate(reinterpret_cast<const void *>(line));
+      }
+
+      // Runs the transpose on the NPU. Returns false (nothing written) when the
+      // shape is outside what the hardware supports, or when the NPU reports an
+      // error; the caller then falls back to the software path.
+      // Elements wider than 1 byte become one extra innermost dimension of
+      // elem_bytes bytes with stride 1, since the NPU permutes single bytes.
+      inline bool NpuTranspose(const int dims, const int32_t *perm,
+                               const int *input_stride, const int32_t *output_shape,
+                               const int elem_bytes, const void *input_data,
+                               void *output_data)
+      {
+#ifdef CFU_SOFTWARE_DEFINED
+        return false; // software CFU has no transpose engine
+#endif
+        const int hw_rank = dims + (elem_bytes > 1 ? 1 : 0);
+        if (dims < 1 || hw_rank > kNpuTransposeMaxRank)
+          return false;
+        if ((reinterpret_cast<uintptr_t>(input_data) |
+             reinterpret_cast<uintptr_t>(output_data)) & 3)
+          return false; // NPU bursts need word-aligned base addresses
+
+        uint32_t total_bytes = static_cast<uint32_t>(elem_bytes);
+        for (int d = 0; d < dims; ++d)
+        {
+          if (output_shape[d] <= 0)
+            return false;
+          total_bytes *= static_cast<uint32_t>(output_shape[d]);
+          if (total_bytes > kNpuTransposeMaxBytes)
+            return false;
+        }
+
+        // Input: write dirty lines back so the NPU reads current data.
+        // Output: write back dirty lines (incl. neighbours sharing the first /
+        // last line) now, and drop the stale copies after the NPU has written.
+        CleanCacheRange(input_data, total_bytes);
+        CleanCacheRange(output_data, total_bytes);
+
+        cfu_op5(NPU_TR_CFG_ADDR, input_data, output_data);
+        cfu_op5(NPU_TR_CFG_SIZE, hw_rank, total_bytes);
+        for (int d = 0; d < dims; ++d)
+        {
+          cfu_op5(NPU_TR_CFG_DST_SHAPE, d, output_shape[d]);
+          cfu_op5(NPU_TR_CFG_SRC_STRIDE, d, input_stride[perm[d]] * elem_bytes);
+        }
+        if (elem_bytes > 1)
+        {
+          cfu_op5(NPU_TR_CFG_DST_SHAPE, dims, elem_bytes);
+          cfu_op5(NPU_TR_CFG_SRC_STRIDE, dims, 1);
+        }
+        const uint32_t status = cfu_op6(0, 0, 0); // 0 ok, 1 AXI error, 2 bad cfg
+
+        InvalidateCacheRange(output_data, total_bytes);
+        return status == 0;
+      }
+
     } // namespace transpose_internal
 
     // Copies a tensor to an other buffer and permutes its dimensions.
@@ -218,9 +307,14 @@ namespace tflite
       std::array<int, kTransposeMaxDimensions> input_stride, output_stride;
       SetupTransposeStrides(input_stride, input_shape.DimsData(), dims);
       SetupTransposeStrides(output_stride, output_shape.DimsData(), dims);
-      TransposeImpl(0, dims, &params.perm[0], input_data_storage,
-                    input_stride.data(), output_data_storage, output_stride.data(),
-                    output_shape.DimsData());
+      if (!transpose_internal::NpuTranspose(dims, &params.perm[0], input_stride.data(),
+                                            output_shape.DimsData(), sizeof(T),
+                                            input_data, output_data))
+      {
+        TransposeImpl(0, dims, &params.perm[0], input_data_storage,
+                      input_stride.data(), output_data_storage, output_stride.data(),
+                      output_shape.DimsData());
+      }
 
       // record cycles
       // TIMING END AND STATISTICS - DO NOT MODIFY OR MOVE.
