@@ -145,23 +145,22 @@ module Transpose #(
   //        every 4th byte (or the last byte) registers a dst_buf write
   //     W: dst_buf written; the last write pulses permute_done
   // -----------------------------------------------------------------------------
-  reg [DIM_W-1:0] layer_loop_control[0:MAX_RANK-1];
-  reg [DIM_W-1:0] layer_src_addr    [0:MAX_RANK-1];
+  reg     [   DIM_W-1:0] layer_loop_control                                  [0:MAX_RANK-1];
+  reg     [   DIM_W-1:0] layer_src_addr                                      [0:MAX_RANK-1];
 
   // ---- next odometer state (combinational) ----
-  reg [MAX_RANK-1:0] layer_wrap;  // dim d is at its last index
-  reg [MAX_RANK-1:0] layer_step;  // every inner dim wraps -> dim d moves
-  reg [   DIM_W-1:0] layer_loop_control_next[0:MAX_RANK-1];
-  reg [   DIM_W-1:0] layer_src_addr_next    [0:MAX_RANK-1];
-  reg [   DIM_W-1:0] outer_src_addr_next;
-  integer j;
+  reg     [MAX_RANK-1:0] layer_wrap;  // dim d is at its last index
+  reg     [MAX_RANK-1:0] layer_step;  // every inner dim wraps -> dim d moves
+  reg     [   DIM_W-1:0] layer_loop_control_next                             [0:MAX_RANK-1];
+  reg     [   DIM_W-1:0] layer_src_addr_next                                 [0:MAX_RANK-1];
+  reg     [   DIM_W-1:0] outer_src_addr_next;
+  integer                j;
   always @(*) begin
     for (j = 0; j < MAX_RANK; j = j + 1)
-      layer_wrap[j] = (j >= rank) || (layer_loop_control[j] == dst_shape[j] - 1'b1);
+    layer_wrap[j] = (j >= rank) || (layer_loop_control[j] == dst_shape[j] - 1'b1);
 
     layer_step[MAX_RANK-1] = 1'b1;
-    for (j = MAX_RANK - 2; j >= 0; j = j - 1)
-      layer_step[j] = layer_step[j+1] && layer_wrap[j+1];
+    for (j = MAX_RANK - 2; j >= 0; j = j - 1) layer_step[j] = layer_step[j+1] && layer_wrap[j+1];
 
     outer_src_addr_next = 0;
     for (j = 0; j < MAX_RANK; j = j + 1) begin
@@ -183,43 +182,43 @@ module Transpose #(
   always @(*) src_rd_idx = src_byte_addr[WIDX_W+1:2];
 
   // ---- stage I: issue one src byte per cycle ----
-  reg  [DIM_W-1:0] issue_cnt;  // bytes issued so far
-  wire             issue = (state == TRANSPOSE) && (issue_cnt != total_bytes);
-  wire             issue_last = (issue_cnt == total_bytes - 1);
+  reg     [DIM_W-1:0] byte_cnt;  // bytes issued so far
+  wire                issue = (state == TRANSPOSE) && (byte_cnt != total_bytes);
+  wire                issue_last = (byte_cnt == total_bytes - 1);
 
   // ---- stage R: src_rd_word valid, pack into dst word ----
-  reg              rd_valid;
-  reg              rd_last;
-  reg  [      1:0] rd_byte_sel;
-  wire [     31:0] rd_word_shift = src_rd_word >> {rd_byte_sel, 3'b000};
-  wire [      7:0] rd_byte = rd_word_shift[7:0];
+  reg                 rd_valid;
+  reg                 rd_last;
+  reg     [      1:0] rd_byte_sel;
+  wire    [     31:0] rd_word_shift = src_rd_word >> {rd_byte_sel, 3'b000};
+  wire    [      7:0] rd_byte = rd_word_shift[7:0];
 
-  reg  [DIM_W-1:0] pack_cnt;  // bytes packed so far = dst byte address
-  reg  [     31:0] pack_word;
-  wire [      1:0] pack_lane = pack_cnt[1:0];
-  wire [     31:0] pack_word_next = pack_word | ({24'd0, rd_byte} << {pack_lane, 3'b000});
+  reg     [DIM_W-1:0] pack_cnt;  // bytes packed so far = dst byte address
+  reg     [     31:0] pack_word;
+  wire    [      1:0] pack_lane = pack_cnt[1:0];
+  wire    [     31:0] pack_word_next = pack_word | ({24'd0, rd_byte} << {pack_lane, 3'b000});
 
   // ---- stage W ----
-  reg              wr_last;
+  reg                 wr_last;
 
-  integer k;
+  integer             k;
   always @(posedge clk_i) begin
     if (!rst_n || permute_start) begin
       for (k = 0; k < MAX_RANK; k = k + 1) begin
         layer_loop_control[k] <= 0;
         layer_src_addr[k]     <= 0;
       end
-      issue_cnt       <= 0;
-      rd_valid        <= 1'b0;
-      rd_last         <= 1'b0;
-      rd_byte_sel     <= 2'd0;
-      pack_cnt        <= 0;
-      pack_word       <= 32'd0;
-      dst_wr_en   <= 1'b0;
-      dst_wr_idx  <= 0;
-      dst_wr_word <= 32'd0;
-      wr_last         <= 1'b0;
-      permute_done    <= 1'b0;
+      byte_cnt     <= 0;
+      rd_valid     <= 1'b0;
+      rd_last      <= 1'b0;
+      rd_byte_sel  <= 2'd0;
+      pack_cnt     <= 0;
+      pack_word    <= 32'd0;
+      dst_wr_en    <= 1'b0;
+      dst_wr_idx   <= 0;
+      dst_wr_word  <= 32'd0;
+      wr_last      <= 1'b0;
+      permute_done <= 1'b0;
     end else begin
       // I
       if (issue) begin
@@ -227,23 +226,23 @@ module Transpose #(
           layer_loop_control[k] <= layer_loop_control_next[k];
           layer_src_addr[k]     <= layer_src_addr_next[k];
         end
-        issue_cnt <= issue_cnt + 1'b1;
+        byte_cnt <= byte_cnt + 1'b1;
       end
       rd_valid    <= issue;
       rd_last     <= issue && issue_last;
       rd_byte_sel <= src_byte_addr[1:0];
 
       // R
-      dst_wr_en <= 1'b0;
-      wr_last       <= 1'b0;
+      dst_wr_en   <= 1'b0;
+      wr_last     <= 1'b0;
       if (rd_valid) begin
         pack_cnt <= pack_cnt + 1'b1;
         if (pack_lane == 2'd3 || rd_last) begin
           dst_wr_en   <= 1'b1;
           dst_wr_idx  <= pack_cnt[WIDX_W+1:2];
           dst_wr_word <= pack_word_next;
-          wr_last         <= rd_last;
-          pack_word       <= 32'd0;
+          wr_last     <= rd_last;
+          pack_word   <= 32'd0;
         end else begin
           pack_word <= pack_word_next;
         end

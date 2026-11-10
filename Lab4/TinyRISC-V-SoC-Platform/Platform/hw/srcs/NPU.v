@@ -333,9 +333,10 @@ module NPU (
 
   wire        logistic_done;
   wire [31:0] logistic_result;
-  Logistic u_logistic (
+  NewLogistic u_logistic (
       .clk    (clk),
       .rst_n  (rst_n),
+      .start  (start_op && op_logistic),
       .input_a(rs1_i),
       .done   (logistic_done),
       .result (logistic_result)
@@ -347,11 +348,11 @@ module NPU (
   // MAC_ACC4 is pipelined (one cycle was too long at 81 MHz):
   //   start: rs1/rs2 registered -> S_L1_COMP: 4 products registered
   //   -> S_L1_SUM: adder tree into mac_sum_r -> S_L1_ACC: acc += mac_sum_r
-  reg signed [31:0] acc_r;
-  reg signed [31:0] offset;
-  reg        [31:0] l1_a_bytes;
-  reg        [31:0] l1_b_bytes;
-  reg signed [31:0] mac_sum_r;
+  reg signed  [31:0] acc_r;
+  reg signed  [31:0] offset;
+  reg         [31:0] l1_a_bytes;
+  reg         [31:0] l1_b_bytes;
+  reg signed  [31:0] mac_sum_r;
   wire signed [31:0] mac_sum;
   NPU_mac4_simd u_mac4_simd (
       .clk    (clk),
@@ -378,37 +379,36 @@ module NPU (
   // COMPUTE reads word j = 0, 1, 2, ... and, once word j arrives, combines it
   // with word j-1 to form group j-1. Groups past N are masked by the lanes.
   //============================================================================
-  reg  [            8:0] N;
+  reg [8:0] N;
   reg signed [8:0] input_offset;
-  reg  [            1:0] ptr1_byte_off;
-  reg  [            1:0] ptr2_byte_off;
-  reg  [      IDX_W-1:0] conv_rd_idx;  // word being requested
-  reg                    conv_rd_valid;  // buf_X_rd_word holds word conv_data_idx
-  reg  [      IDX_W-1:0] conv_data_idx;
-  reg  [           31:0] ptr1_prev_word;
-  reg  [           31:0] ptr2_prev_word;
+  reg [1:0] ptr1_byte_off;
+  reg [1:0] ptr2_byte_off;
+  reg [IDX_W-1:0] conv_rd_idx;  // word being requested
+  reg conv_rd_valid;  // buf_X_rd_word holds word conv_data_idx
+  reg [IDX_W-1:0] conv_data_idx;
+  reg [31:0] ptr1_prev_word;
+  reg [31:0] ptr2_prev_word;
   reg signed [31:0] accum;
 
-  wire [            7:0] conv_groups = (N + 9'd3) >> 2;  // ceil(N / 4)
-  wire [           63:0] ptr1_pair = {buf_a_rd_word, ptr1_prev_word};
-  wire [           63:0] ptr2_pair = {buf_b_rd_word, ptr2_prev_word};
-  wire [           31:0] lane_in_bytes = ptr1_pair >> {ptr1_byte_off, 3'b000};
-  wire [           31:0] lane_flt_bytes = ptr2_pair >> {ptr2_byte_off, 3'b000};
-  wire [      IDX_W-1:0] conv_group = conv_data_idx - 1'b1;
-  wire                   conv_group_valid = conv_rd_valid && (conv_data_idx != 0) &&
-                                            (conv_data_idx <= conv_groups);
-  wire                   conv_last_group = (conv_data_idx == conv_groups);
+  wire [7:0] conv_groups = (N + 9'd3) >> 2;  // ceil(N / 4)
+  wire [63:0] ptr1_pair = {buf_a_rd_word, ptr1_prev_word};
+  wire [63:0] ptr2_pair = {buf_b_rd_word, ptr2_prev_word};
+  wire [31:0] lane_in_bytes = ptr1_pair >> {ptr1_byte_off, 3'b000};
+  wire [31:0] lane_flt_bytes = ptr2_pair >> {ptr2_byte_off, 3'b000};
+  wire [IDX_W-1:0] conv_group = conv_data_idx - 1'b1;
+  wire conv_group_valid = conv_rd_valid && (conv_data_idx != 0) && (conv_data_idx <= conv_groups);
+  wire conv_last_group = (conv_data_idx == conv_groups);
 
   // COMPUTE pipeline (BRAM -> MAC -> accumulate is too long for one cycle):
   //   P1: aligned lane bytes of one group      P2: 4-lane MAC sum
   //   then accum += P2 sum
-  reg                    p1_valid;
-  reg                    p1_last;
-  reg  [           31:0] p1_in_bytes;
-  reg  [           31:0] p1_flt_bytes;
-  reg  [           31:0] p1_group_byte;
-  reg                    p2_valid;
-  reg                    p2_last;
+  reg p1_valid;
+  reg p1_last;
+  reg [31:0] p1_in_bytes;
+  reg [31:0] p1_flt_bytes;
+  reg [31:0] p1_group_byte;
+  reg p2_valid;
+  reg p2_last;
   reg signed [31:0] p2_sum;
   wire signed [31:0] compute_sum;
 
@@ -441,9 +441,9 @@ module NPU (
     // buf_a: AXI fills it (Conv ptr1 / Transpose src), Conv or Transpose reads
     buf_a_we      = axi_rd_valid && ((state_r == S_CONV_LOAD && !conv_load_ptr2) ||
                                      state_r == S_TR_LOAD);
-    buf_a_wr_idx  = axi_rd_idx;
+    buf_a_wr_idx = axi_rd_idx;
     buf_a_wr_word = axi_rd_word;
-    buf_a_rd_idx  = (state_r == S_TR_PERM) ? tr_src_rd_idx : conv_rd_idx;
+    buf_a_rd_idx = (state_r == S_TR_PERM) ? tr_src_rd_idx : conv_rd_idx;
 
     // buf_b: AXI fills it (Conv ptr2) or Transpose writes it (dst);
     //        Conv reads it, or AXI streams it out (Transpose STORE)
@@ -462,8 +462,8 @@ module NPU (
   // AXI write data: buf_b for Transpose STORE, Lab1 data otherwise. Lab1
   // data is registered so it has the same 1-cycle latency as a BRAM read.
   reg [31:0] l1_wr_word;
-  always @(posedge clk) l1_wr_word <= (axi_wr_idx == 0) ? (l1_misaligned ? l1_wdata0 : rs2_i)
-                                                        : l1_wdata1;
+  always @(posedge clk)
+    l1_wr_word <= (axi_wr_idx == 0) ? (l1_misaligned ? l1_wdata0 : rs2_i) : l1_wdata1;
   always @(*) axi_wr_word = (state_r == S_TR_STORE) ? buf_b_rd_word : l1_wr_word;
 
   //============================================================================
