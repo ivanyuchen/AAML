@@ -1,4 +1,4 @@
-module NewLogistic (
+module Logistic (
     input clk,
     input rst_n,
     input start,

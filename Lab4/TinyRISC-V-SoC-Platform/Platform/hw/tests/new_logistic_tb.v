@@ -17,7 +17,7 @@ module new_logistic_tb;
   real error;
   real max_error = 0.0;
 
-  NewLogistic dut (
+  Logistic dut (
       .clk(clk), .rst_n(rst_n), .start(start),
       .input_a(input_a), .done(done), .result(result)
   );

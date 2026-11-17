@@ -333,7 +333,7 @@ module NPU (
 
   wire        logistic_done;
   wire [31:0] logistic_result;
-  NewLogistic u_logistic (
+  Logistic u_logistic (
       .clk    (clk),
       .rst_n  (rst_n),
       .start  (start_op && op_logistic),
