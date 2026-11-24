@@ -59,7 +59,10 @@ module dcache_pro(
     
     //B
     input wm_success,
-    input wm_complete 
+    input wm_complete, 
+
+  // from clean_cache
+  input invalidate_all_i
 );  
     
     // cpu valid
@@ -291,6 +294,12 @@ module dcache_pro(
 						wr_dty = cpu_wr;
 						data_vld = 1;
 					end
+      CL_SCAN:  if(!(walk_dty0|walk_dty1)) begin
+        if(invalidate_all_i) begin
+          wr_vld = 2'b11;
+          vld_i = 1'b0;
+        end
+      end
 			WMEND: 	if(wm_complete & wm_success)begin //update cache block&status
 						wr_dty = (hold_wb | hold_flush) ? {hold_match1, hold_match0} : {lru, ~lru};//lru ? 2'b10 : 2'b01;
 						wr_vld = {hold_match1 & hold_flush, hold_match0 & hold_flush};
@@ -307,8 +316,9 @@ module dcache_pro(
 					end
 				    else if(rm_complete & ~rm_success)
 				        {exception_saf,exception_laf} = {hold_cpu_wr,~hold_cpu_wr};
-			CL_WMEND: if(wm_complete)   // clear dirty even on a failed write, so the walk always terminates
-						wr_dty = {walk_way, ~walk_way};
+			CL_WMEND: if(wm_complete) begin  // clear dirty even on a failed write, so the walk always terminates
+        		wr_dty = {walk_way, ~walk_way};
+      end
 			RECOMP: begin
                         //cpu_wr = {(hold_tag_i == tag_1) & hold_cpu_wr, (hold_tag_i == tag_0) & hold_cpu_wr};
                         cpu_wr = {lru & hold_cpu_wr, ~lru & hold_cpu_wr};

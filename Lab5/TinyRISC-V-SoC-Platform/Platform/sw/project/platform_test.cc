@@ -3,7 +3,6 @@
 #include <stdint.h>
 #include <stdio.h>
 
-#include "cbo.h"
 #include "cfu.h"
 
 namespace

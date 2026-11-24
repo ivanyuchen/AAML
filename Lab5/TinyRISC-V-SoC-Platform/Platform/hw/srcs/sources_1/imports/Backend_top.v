@@ -576,7 +576,12 @@ assign rs1_o     = npu_rs1_r;
 assign rs2_o     = npu_rs2_r;
 assign funct3_o  = npu_funct3_r;
 assign funct7_o  = npu_funct7_r;
-assign NPU_start = npu_start_r;
+// Only memory-moving START instructions need cache coordination.
+// Registered operands remain held while EX waits for the real NPU_done.
+wire npu_needs_clean = ((npu_funct3_r == 4'd7) && (npu_funct7_r == 0)) ||
+                       (npu_funct3_r == 4'd6); // retained Transpose accelerator
+wire npu_clean_req, npu_invalidate_all, npu_start_after_clean;
+assign NPU_start = npu_start_after_clean | (npu_start_r && !npu_needs_clean);
 
 MUL_DIV_top m_MUL_DIV_top(
     .clk           (clk), .rst_n         (rst_n), .data1         (EX_fwd_data1),
@@ -600,6 +605,17 @@ wire        mem_writeback_valid;
 // straight off EX_MEM_Reg's own held output (MEM_rd/MEM_is_impl/...) instead,
 // since EX_MEM_Reg now stays frozen on that same info for the whole window.
 wire        mem_busy;
+
+clean_cache u_clean_cache (
+    .clk_i(clk), .rst_n(rst_n),
+    .is_npu_i(npu_start_r && npu_needs_clean),
+    .mem_busy(mem_busy), .mem_write_back_valid(mem_writeback_valid),
+    .req_i(mem_req),
+    .clean_all_done(dcache_clean_done && npu_clean_req),
+    .npu_done(NPU_done),
+    .clean_all_o(npu_clean_req), .invalidate_all_o(npu_invalidate_all),
+    .npu_start(npu_start_after_clean)
+);
 
 // High while the in-flight access is a fast-path op confirmed to be a cache
 // hit -- lets PipelineCtrl.v admit a second mem op back-to-back instead of
@@ -633,7 +649,8 @@ MEM m_MEM (
     .dcache_mask_o       (mem_dcache_mask), .dcache_req_rd_o     (mem_dcache_req_rd),
     .dcache_req_wr_o     (mem_dcache_req_wr), .dcache_flush_o      (mem_dcache_flush),
     .dcache_invalidate_o (mem_dcache_invalidate), .dcache_writeback_o  (mem_dcache_writeback),
-    .dcache_clean_all_o  (mem_dcache_clean_all), .dcache_clean_done_i (dcache_clean_done),
+    .dcache_clean_all_o  (mem_dcache_clean_all),
+    .dcache_clean_done_i (dcache_clean_done && mem_dcache_clean_all),
     .dcache_resp_data_i  (dcache_in_value_i), .dcache_resp_valid_i (dcache_in_valid_i),
     .dcache_hit_i        (dcache_hit_o),
 
@@ -689,7 +706,10 @@ dcache_pro m_dcache (
     .cpu_req_rd        (mem_dcache_req_rd), .cpu_data_o        (dcache_in_value_i), .dcache_rdy_o      (),
     .dcache_data_vld_o (dcache_in_valid_i), .d_exception       (), .hit_o             (dcache_hit_o), .invalidate_i      (mem_dcache_invalidate),
     .flush_i           (mem_dcache_flush), .writeback_i       (mem_dcache_writeback), .mem_addr          (dbus_rm_addr),
-    .clean_all_i       (mem_dcache_clean_all), .clean_done_o      (dcache_clean_done),
+    // The NPU controller waits for MEM to drain, so these requests cannot
+    // own the cache simultaneously. fence.i retains its writeback-only mode.
+    .clean_all_i       (mem_dcache_clean_all | npu_clean_req),
+    .invalidate_all_i  (npu_invalidate_all), .clean_done_o (dcache_clean_done),
     .rm_rdy            (dbus_rm_rdy), .rm_data           (dbus_rm_data), .rm_success        (dbus_rm_success),
     .rm_complete       (dbus_rm_complete), .rm_vld            (dbus_rm_vld), .wm_rdy            (dbus_wm_rdy),
     .wm_data           (dbus_wm_data), .wm_vld            (dbus_wm_vld), .wm_success        (dbus_wm_success),

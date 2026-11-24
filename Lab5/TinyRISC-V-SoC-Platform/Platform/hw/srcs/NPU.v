@@ -1,81 +1,44 @@
 `timescale 1ns / 1ps
 //==============================================================================
-// NPU: CUSTOM-0 coprocessor of the TinyRISC-V CPU.
+// Lab5 CUSTOM-0 instruction map (opcode = 0x0B)
 //
-// Hierarchy
-//   NPU
-//   +-- u_decode     NPU_decode     funct3 / funct7 -> one-hot op flags
-//   +-- u_axi        NPU_axi        the only AXI4 master (burst read / write)
-//   +-- u_buf_a      bram_sdp       Conv ptr1 buffer  /  Transpose src_buf
-//   +-- u_buf_b      bram_sdp       Conv ptr2 buffer  /  Transpose dst_buf
-//   +-- u_transpose  Transpose      permute engine (src_buf -> dst_buf)
-//   +-- u_logistic   Logistic       int8 sigmoid pipeline
-//   +-- u_mac4_simd  NPU_mac4_simd  Lab1 MAC
-//   +-- u_mac4_lanes NPU_mac4_lanes Lab2 (Conv) MAC
+// 已實作的指令：
+// funct3 funct7  功能                  rs1                  rs2
+//   0    >2     Scalar add            加數                 加數
+//               NPU_out = rs1 + rs2 + funct7；平台測試使用 funct7=5。
+//   4    任意   Logistic              signed Q4.27 raw      不使用
+//               NPU_out = Q0.31 raw sigmoid result。
+//   5     0     Transpose 地址設定     input byte address   output byte address
+//   5     1     Transpose 大小設定     rank (1..6)          total bytes
+//   5     2     Transpose shape       dimension d          output_shape[d]
+//   5     3     Transpose stride      dimension d          input_stride[perm[d]]
+//               stride 單位為 bytes；設定指令 NPU_out=0。
+//               Transpose 僅解碼 funct7[2:0]，軟體請固定使用 0..3。
+//   6    任意   Transpose 啟動         不使用               不使用
+//               等待 AXI 讀取、排列及寫回完成，才回覆 NPU_done。
+//               NPU_out: 0=成功，1=AXI error，2=不支援的地址/大小。
 //
-// Buffer sharing: only one instruction runs at a time, so Conv and Transpose
-// never use buf_a / buf_b together. A Transpose overwrites whatever Conv had
-// loaded (Conv always reloads with LOAD_PTR1/2 before COMPUTE).
+// TPU / GEMV 指令分配（已接設定、A/B 載入、TPU 計算與 C 寫回）：
+// funct3 funct7  功能                  rs1                  rs2
+//   7     1     GEMV_CFG_AB           packed A byte addr   packed B byte addr
+//   7     2     GEMV_CFG_C            int32 C byte addr    0（保留）
+//   7     3     GEMV_CFG_DIMS         M                    K
+//   7     0     GEMV_START            0（保留）            0（保留）
 //
-//==============================================================================
-// CUSTOM-0 instruction allocation (opcode 0x0B, funct3_i selects the op)
+// 預定軟體呼叫順序（使用 cfu_op7 / cfu_raw_op）：
+//   cfu_op7(1, packed_A, packed_B);  // 設定已打包的 A/B buffers
+//   cfu_op7(2, matC, 0);            // 結果直接寫到呼叫者的 C buffer
+//   cfu_op7(3, M, K);               // A: M x K，B: K，C: M
+//   status = cfu_op7(0, 0, 0);      // 阻塞至結果寫回完成
+// 預定設定指令成功回傳 0；START 回傳 0=成功、1=AXI error、2=參數錯誤。
+// Basic 1 所需的軟體 cache maintenance 由 wrapper 在呼叫前後處理。
+// 實作後 NPU_done 必須等最後一筆 AXI write response 完成才送出。
+// START: 載入 A/B -> TPU 計算 -> 寫回 M 個 int32 結果 -> NPU_done。
 //
-// Protocol for every op: CPU issues the instruction -> NPU_start -> NPU
-// works (multicycle allowed) -> NPU_done=1 only when NPU_out is valid.
-// The CPU stalls until NPU_done. funct7_i is a sub-function field.
-//
-// funct3  funct7  Name            Owner     rs1 / rs2 / NPU_out
-// ------  ------  --------------  --------  ------------------------------
-//  0      0       MAC_CLEAR       Lab1      NPU_out = 0, acc = 0
-//  0      1       MAC_SET_OFFSET  Lab1      rs1 = input offset
-//  0      2       MAC_ACC4        Lab1      acc += sum_{4 bytes}
-//                                           (rs1.byte + offset) * rs2.byte
-//                                           NPU_out = acc
-//  0      other   COMPUTE         platform  stock example: rs1+rs2+funct7
-//  1      -       AXI_READ        Lab1      single read, rs1 = addr
-//                                           (misaligned ok), NPU_out = data
-//  2      -       AXI_WRITE       Lab1      single write, rs1 = addr,
-//                                           rs2 = data (misaligned ok,
-//                                           uses WSTRB), done after B resp
-//  3      0       MAC_CONFIG      Lab2      KEEP (Conv uses hw_simd_mac).
-//                                           rs1 = N, rs2 = input_offset
-//  3      1       MAC_LOAD_PTR1   Lab2      rs1 = ptr1. Burst-reads N bytes
-//                                           into buf_a. NPU_out unchanged
-//  3      2       MAC_LOAD_PTR2   Lab2      rs1 = ptr2. Burst-reads N bytes
-//                                           into buf_b. NPU_out unchanged
-//  3      3       MAC_COMPUTE     Lab2      no read. NPU_out = sum over N of
-//                                           (buf_a[i] + off) * buf_b[i]
-//                                           (needs CONFIG, PTR1, PTR2 first)
-//  4      -       LOGISTIC        Lab4      sigmoid of one element.
-//                                           rs1 = signed Q4.27 raw input
-//                                           NPU_out = Q0.31 raw result
-//  5      0..3    TRANSPOSE_CFG   Lab4      write a config register:
-//                                             0: rs1 = src base addr
-//                                                rs2 = dst base addr
-//                                             1: rs1 = rank (1..6)
-//                                                rs2 = total bytes
-//                                             2: rs1 = dim d
-//                                                rs2 = output_shape[d]
-//                                             3: rs1 = dim d
-//                                                rs2 = input_stride[perm[d]]
-//                                                      (in BYTES)
-//                                           dim 0 = outermost. NPU_out = 0
-//  6      -       TRANSPOSE_START Lab4      load src -> permute -> store dst.
-//                                           NPU_done after the last write
-//                                           response. NPU_out:
-//                                             0 ok
-//                                             1 AXI error response
-//                                             2 bad config (base addr not
-//                                               word aligned or total bytes
-//                                               > TR_BUF_BYTES)
-//  7      -       (free)                    spare
-//
-// Rules:
-//  - Do not change funct3 = 0/1/2 (Lab1) or 3 (Lab2): Lab4 spec says
-//    preserve the Lab1/Lab2 instructions (Conv uses funct3 = 3).
-//  - funct3_i is 4 bits wide but the instruction carries only 3.
-//  - Transpose: CPU never touches tensor data; it only does cfg writes,
-//    start, wait, and the cache clean/invalidate around the call.
+// 可重新使用：funct3=1/2/3，以及 funct3=0 的 funct7=0/1/2。
+// 舊 Lab1 MAC / 單筆 AXI 指令、Lab2 SIMD MAC 已移除。
+// 尚未實作的非 TPU 指令回傳 3。
+// funct3_i 雖有 4 bits，指令解碼只使用最低 3 bits。
 //==============================================================================
 module NPU (
     input clk,
@@ -138,53 +101,20 @@ module NPU (
   localparam TR_BUF_BYTES = 16384;  // largest MobileViT transpose = 16KB
   localparam BUF_WORDS = TR_BUF_BYTES / 4;
   localparam IDX_W = $clog2(BUF_WORDS);
+  localparam C_BUF_WORDS = 256;  // GEMV has at most 254 int32 outputs.
+  localparam C_IDX_W = $clog2(C_BUF_WORDS);
 
-  //============================================================================
-  // FSM states
-  //============================================================================
-  localparam S_IDLE = 4'd0;
-  localparam S_DONE = 4'd1;
-  localparam S_ADD = 4'd2;  // funct3=0 (other funct7) stock add
-  localparam S_L1_COMP = 4'd3;  // funct3=0 Lab1 MAC
-  localparam S_L1_AXI = 4'd4;  // funct3=1/2 waiting for NPU_axi
-  localparam S_CONV_LOAD = 4'd5;  // funct3=3 LOAD_PTR1/2 waiting for NPU_axi
-  localparam S_CONV_COMP = 4'd6;  // funct3=3 COMPUTE
-  localparam S_LOGISTIC = 4'd7;  // funct3=4
-  localparam S_TR_LOAD = 4'd8;  // funct3=6 DDR -> buf_a
-  localparam S_TR_PERM = 4'd9;  //          buf_a -> buf_b
-  localparam S_TR_STORE = 4'd10;  //          buf_b -> DDR
-  localparam S_L1_ACC = 4'd11;  // funct3=0 MAC_ACC4: acc += registered mac_sum
-  localparam S_L1_SUM = 4'd12;  // funct3=0 MAC_ACC4: products -> mac_sum_r
-
+  localparam S_IDLE = 4'd0, S_DONE = 4'd1, S_ADD = 4'd2,
+             S_LOGISTIC = 4'd3, S_TR_LOAD = 4'd4,
+             S_TR_PERM = 4'd5, S_TR_STORE = 4'd6,
+             S_TPU_LOAD = 4'd7, S_TPU_WORK = 4'd8, S_TPU_STORE = 4'd9;
   reg [3:0] state_r, next_state;
-
-  wire start_op = (state_r == S_IDLE) && NPU_start;
-
-  //============================================================================
-  // Decode (the op flags are valid while the CPU holds the instruction)
-  //============================================================================
-  wire op_mac_clear, op_mac_set_offset, op_mac_acc4, op_add;
-  wire op_axi_read, op_axi_write;
-  wire op_conv_config, op_conv_load_ptr1, op_conv_load_ptr2, op_conv_compute;
-  wire op_logistic, op_tr_cfg, op_tr_start;
-
-  NPU_decode u_decode (
-      .funct3_i         (funct3_i),
-      .funct7_i         (funct7_i),
-      .op_mac_clear     (op_mac_clear),
-      .op_mac_set_offset(op_mac_set_offset),
-      .op_mac_acc4      (op_mac_acc4),
-      .op_add           (op_add),
-      .op_axi_read      (op_axi_read),
-      .op_axi_write     (op_axi_write),
-      .op_conv_config   (op_conv_config),
-      .op_conv_load_ptr1(op_conv_load_ptr1),
-      .op_conv_load_ptr2(op_conv_load_ptr2),
-      .op_conv_compute  (op_conv_compute),
-      .op_logistic      (op_logistic),
-      .op_tr_cfg        (op_tr_cfg),
-      .op_tr_start      (op_tr_start)
-  );
+  wire             start_op = (state_r == S_IDLE) && NPU_start;
+  wire             op_add = (funct3_i[2:0] == 3'd0) && (funct7_i > 32'd2);
+  wire             op_logistic = (funct3_i[2:0] == 3'd4);
+  wire             op_tr_cfg = (funct3_i[2:0] == 3'd5);
+  wire             op_tr_start = (funct3_i[2:0] == 3'd6);
+  wire             op_tpu = (funct3_i[2:0] == 3'd7);
 
   //============================================================================
   // Sub-module wires
@@ -215,6 +145,17 @@ module NPU (
   reg  [     31:0] buf_b_wr_word;
   reg  [IDX_W-1:0] buf_b_rd_idx;
   wire [     31:0] buf_b_rd_word;
+
+  // TPU C buffer ports: one signed int32 result per word.
+  reg              buf_c_we;
+  reg  [C_IDX_W-1:0] buf_c_wr_idx;
+  reg  [     31:0] buf_c_wr_word;
+  reg  [C_IDX_W-1:0] buf_c_rd_idx;
+  wire [     31:0] buf_c_rd_word;
+
+  wire [15:0] tpu_a_idx, tpu_b_idx, tpu_c_idx;
+  wire tpu_c_ram_en, tpu_c_wr_en;
+  wire [    127:0] tpu_c_data;
 
   // Transpose
   wire [     31:0] tr_src_base_addr;
@@ -309,7 +250,17 @@ module NPU (
       .data_i      (buf_b_wr_word),
       .data_o      (buf_b_rd_word)
   );
-
+  bram_sdp #(
+      .ENTRY_NUM(C_BUF_WORDS),
+      .DWIDTH   (32)
+  ) u_buf_c (
+      .clk_i       (clk),
+      .we_i        (buf_c_we),
+      .read_addr_i (buf_c_rd_idx),
+      .write_addr_i(buf_c_wr_idx),
+      .data_i      (buf_c_wr_word),
+      .data_o      (buf_c_rd_word)
+  );
   Transpose #(
       .BUF_BYTES(TR_BUF_BYTES)
   ) u_transpose (
@@ -343,89 +294,6 @@ module NPU (
   );
 
   //============================================================================
-  // Lab1: MAC + single AXI read / write
-  //============================================================================
-  // MAC_ACC4 is pipelined (one cycle was too long at 81 MHz):
-  //   start: rs1/rs2 registered -> S_L1_COMP: 4 products registered
-  //   -> S_L1_SUM: adder tree into mac_sum_r -> S_L1_ACC: acc += mac_sum_r
-  reg signed  [31:0] acc_r;
-  reg signed  [31:0] offset;
-  reg         [31:0] l1_a_bytes;
-  reg         [31:0] l1_b_bytes;
-  reg signed  [31:0] mac_sum_r;
-  wire signed [31:0] mac_sum;
-  NPU_mac4_simd u_mac4_simd (
-      .clk    (clk),
-      .offset (offset),
-      .a_bytes(l1_a_bytes),
-      .b_bytes(l1_b_bytes),
-      .sum    (mac_sum)
-  );
-
-  // A misaligned access touches two words: done as a 2-beat burst.
-  wire [1:0] l1_byte_off = rs1_i[1:0];
-  wire l1_misaligned = (l1_byte_off != 2'b00);
-  wire [4:0] l1_shift = {l1_byte_off, 3'b000};
-  wire [31:0] l1_wdata0 = rs2_i << l1_shift;
-  wire [31:0] l1_wdata1 = rs2_i >> (6'd32 - l1_shift);
-  wire [3:0] l1_wstrb0 = l1_misaligned ? (4'b1111 << l1_byte_off) : 4'b1111;
-  wire [3:0] l1_wstrb1 = l1_misaligned ? (4'b1111 >> (3'd4 - l1_byte_off)) : 4'b1111;
-
-  //============================================================================
-  // Lab2 (Conv): N bytes in buf_a (ptr1) / buf_b (ptr2), 4 lanes per cycle
-  //
-  // Each buffer holds the words starting at ptrX & ~3, so lane group g needs
-  // bytes [s + 4g, s + 4g + 3] (s = ptrX[1:0]) = words g and g+1.
-  // COMPUTE reads word j = 0, 1, 2, ... and, once word j arrives, combines it
-  // with word j-1 to form group j-1. Groups past N are masked by the lanes.
-  //============================================================================
-  reg [8:0] N;
-  reg signed [8:0] input_offset;
-  reg [1:0] ptr1_byte_off;
-  reg [1:0] ptr2_byte_off;
-  reg [IDX_W-1:0] conv_rd_idx;  // word being requested
-  reg conv_rd_valid;  // buf_X_rd_word holds word conv_data_idx
-  reg [IDX_W-1:0] conv_data_idx;
-  reg [31:0] ptr1_prev_word;
-  reg [31:0] ptr2_prev_word;
-  reg signed [31:0] accum;
-
-  wire [7:0] conv_groups = (N + 9'd3) >> 2;  // ceil(N / 4)
-  wire [63:0] ptr1_pair = {buf_a_rd_word, ptr1_prev_word};
-  wire [63:0] ptr2_pair = {buf_b_rd_word, ptr2_prev_word};
-  wire [31:0] lane_in_bytes = ptr1_pair >> {ptr1_byte_off, 3'b000};
-  wire [31:0] lane_flt_bytes = ptr2_pair >> {ptr2_byte_off, 3'b000};
-  wire [IDX_W-1:0] conv_group = conv_data_idx - 1'b1;
-  wire conv_group_valid = conv_rd_valid && (conv_data_idx != 0) && (conv_data_idx <= conv_groups);
-  wire conv_last_group = (conv_data_idx == conv_groups);
-
-  // COMPUTE pipeline (BRAM -> MAC -> accumulate is too long for one cycle):
-  //   P1: aligned lane bytes of one group      P2: 4-lane MAC sum
-  //   then accum += P2 sum
-  reg p1_valid;
-  reg p1_last;
-  reg [31:0] p1_in_bytes;
-  reg [31:0] p1_flt_bytes;
-  reg [31:0] p1_group_byte;
-  reg p2_valid;
-  reg p2_last;
-  reg signed [31:0] p2_sum;
-  wire signed [31:0] compute_sum;
-
-  NPU_mac4_lanes u_mac4_lanes (
-      .input_offset(input_offset),
-      .in_bytes    (p1_in_bytes),
-      .flt_bytes   (p1_flt_bytes),
-      .ptr1_byte   (p1_group_byte),
-      .ptr1_end    ({23'd0, N} - 1'b1),
-      .ptr2_byte   (p1_group_byte),
-      .ptr2_end    ({23'd0, N} - 1'b1),
-      .sum         (compute_sum)
-  );
-
-  reg conv_load_ptr2;  // LOAD target: 0 = buf_a (ptr1), 1 = buf_b (ptr2)
-
-  //============================================================================
   // Transpose START checks
   //============================================================================
   wire [IDX_W:0] tr_beats = (tr_total_bytes + 32'd3) >> 2;
@@ -434,255 +302,230 @@ module NPU (
   wire tr_bad_cfg = (tr_src_base_addr[1:0] != 2'b00) || (tr_dst_base_addr[1:0] != 2'b00) ||
                     (tr_total_bytes > TR_BUF_BYTES);
 
-  //============================================================================
-  // Buffer port muxes (selected by state; only one user at a time)
-  //============================================================================
+  // Transpose input / output buffer ports; no legacy Conv buffer muxes.
   always @(*) begin
-    // buf_a: AXI fills it (Conv ptr1 / Transpose src), Conv or Transpose reads
-    buf_a_we      = axi_rd_valid && ((state_r == S_CONV_LOAD && !conv_load_ptr2) ||
-                                     state_r == S_TR_LOAD);
+    buf_a_we = axi_rd_valid && ((state_r == S_TR_LOAD) || (state_r == S_TPU_LOAD && !loading_b));
     buf_a_wr_idx = axi_rd_idx;
     buf_a_wr_word = axi_rd_word;
-    buf_a_rd_idx = (state_r == S_TR_PERM) ? tr_src_rd_idx : conv_rd_idx;
+    buf_a_rd_idx = (state_r == S_TPU_WORK) ? tpu_a_idx[IDX_W-1:0] : tr_src_rd_idx;
+    buf_b_we = (state_r == S_TR_PERM) ? tr_dst_wr_en :
+               (axi_rd_valid && state_r == S_TPU_LOAD && loading_b);
+    buf_b_wr_idx = (state_r == S_TR_PERM) ? tr_dst_wr_idx : axi_rd_idx;
+    buf_b_wr_word = (state_r == S_TR_PERM) ? tr_dst_wr_word : axi_rd_word;
+    buf_b_rd_idx = (state_r == S_TPU_WORK) ? tpu_b_idx[IDX_W-1:0] : axi_wr_idx;
 
-    // buf_b: AXI fills it (Conv ptr2) or Transpose writes it (dst);
-    //        Conv reads it, or AXI streams it out (Transpose STORE)
-    if (state_r == S_TR_PERM) begin
-      buf_b_we      = tr_dst_wr_en;
-      buf_b_wr_idx  = tr_dst_wr_idx;
-      buf_b_wr_word = tr_dst_wr_word;
-    end else begin
-      buf_b_we      = axi_rd_valid && state_r == S_CONV_LOAD && conv_load_ptr2;
-      buf_b_wr_idx  = axi_rd_idx;
-      buf_b_wr_word = axi_rd_word;
-    end
-    buf_b_rd_idx = (state_r == S_TR_STORE) ? axi_wr_idx : conv_rd_idx;
+    // TPU emits one result in [127:96], with its output-row index.
+    buf_c_we = (state_r == S_TPU_WORK) && tpu_c_ram_en && tpu_c_wr_en;
+    buf_c_wr_idx = tpu_c_idx[C_IDX_W-1:0];
+    buf_c_wr_word = tpu_c_data[127:96];
+    buf_c_rd_idx = axi_wr_idx[C_IDX_W-1:0];
+    axi_wr_word = (state_r == S_TPU_STORE) ? buf_c_rd_word : buf_b_rd_word;
   end
+  //============================================================================
+  // TPU
+  //============================================================================
+  // funct3 funct7  功能                  rs1                  rs2
+  //   7     1     GEMV_CFG_AB           packed A byte addr   packed B byte addr
+  //   7     2     GEMV_CFG_C            int32 C byte addr    0（保留）
+  //   7     3     GEMV_CFG_DIMS         M                    K
+  //   7     0     GEMV_START            0（保留）            0（保留）
 
-  // AXI write data: buf_b for Transpose STORE, Lab1 data otherwise. Lab1
-  // data is registered so it has the same 1-cycle latency as a BRAM read.
-  reg [31:0] l1_wr_word;
-  always @(posedge clk)
-    l1_wr_word <= (axi_wr_idx == 0) ? (l1_misaligned ? l1_wdata0 : rs2_i) : l1_wdata1;
-  always @(*) axi_wr_word = (state_r == S_TR_STORE) ? buf_b_rd_word : l1_wr_word;
+  reg [7:0] M, N, K;
+  reg [31:0] matA_addr, matB_addr, matC_addr;
+  wire [2:0] tpu_cfg_feild = funct7_i[2:0];
+  reg tpu_in_valid;
+  wire tpu_busy;
+  TPU u_tpu (
+      .clk(clk),
+      .rst_n(rst_n),
+      .in_valid(tpu_in_valid),
+      .M(M),
+      .K(K),
+      .N(8'd1),
+      .busy(tpu_busy),
+      .A_ram_en(),
+      .A_wr_en(),
+      .A_index(tpu_a_idx),
+      .A_data_in(),
+      .A_data_out(buf_a_rd_word),
+      .B_ram_en(),
+      .B_wr_en(),
+      .B_index(tpu_b_idx),
+      .B_data_in(),
+      .B_data_out(buf_b_rd_word),
+      .C_ram_en(tpu_c_ram_en),
+      .C_wr_en(tpu_c_wr_en),
+      .C_index(tpu_c_idx),
+      .C_data_in(tpu_c_data),
+      .C_data_out(128'd0)
+  );
+  localparam GEMV_START = 0, GEMV_CFG_AB = 1, GEMV_CFG_C = 2, GEMV_CFG_DIMS = 3;
+  always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+
+    end else if (start_op && op_tpu) begin
+      case (tpu_cfg_feild)
+        GEMV_CFG_AB: begin
+          matA_addr <= rs1_i;
+          matB_addr <= rs2_i;
+        end
+        GEMV_CFG_C: begin
+          matC_addr <= rs1_i;
+        end
+        GEMV_CFG_DIMS: begin
+          M <= rs1_i[7:0];
+          K <= rs2_i[7:0];
+        end
+        default: ;
+      endcase
+    end
+  end
+  //============================================================================
+  // TPU A/B load: A has ceil(M/4)*K packed words; B has K packed words.
+  // C is an output and is not read from DDR.
+  //============================================================================
+  reg loading_b;  // 0: fill buf_a, 1: fill buf_b
+  wire [8:0] tpu_row_blocks = ({1'b0, M} + 9'd3) >> 2;
+  wire [16:0] tpu_a_words = {8'd0, tpu_row_blocks} * {9'd0, K};
+  wire tpu_start_cmd = op_tpu && (tpu_cfg_feild == GEMV_START);
+  wire tpu_bad_cfg = (M == 0) || (K == 0) || (M > 254) || (K > 254) ||
+                     (tpu_a_words > 1024) ||
+                     (matA_addr[1:0] != 0) || (matB_addr[1:0] != 0) ||
+                     (matC_addr[1:0] != 0);
+
+
+
 
   //============================================================================
-  // FSM part 1/3: state register
+  // Control State
   //============================================================================
+
   always @(posedge clk or negedge rst_n) begin
     if (!rst_n) state_r <= S_IDLE;
     else state_r <= next_state;
   end
 
-  //============================================================================
-  // FSM part 2/3: next-state logic
-  //============================================================================
   always @(*) begin
     next_state = state_r;
     case (state_r)
-      S_IDLE: begin
-        if (NPU_start) begin
-          if (op_mac_clear || op_mac_set_offset || op_mac_acc4) next_state = S_L1_COMP;
-          else if (op_add) next_state = S_ADD;
-          else if (op_axi_read || op_axi_write) next_state = S_L1_AXI;
-          else if (op_conv_load_ptr1 || op_conv_load_ptr2) next_state = S_CONV_LOAD;
-          else if (op_conv_compute) next_state = S_CONV_COMP;
-          else if (op_logistic) next_state = S_LOGISTIC;
-          else if (op_tr_start && !tr_bad_cfg && tr_total_bytes != 0) next_state = S_TR_LOAD;
-          else next_state = S_DONE;  // CONFIG / TRANSPOSE_CFG / bad start / no-op
-        end
+      S_IDLE:
+      if (NPU_start) begin
+        if (op_add) next_state = S_ADD;
+        else if (op_logistic) next_state = S_LOGISTIC;
+        else if (op_tr_start && !tr_bad_cfg && tr_total_bytes != 0) next_state = S_TR_LOAD;
+        else if (tpu_start_cmd && !tpu_bad_cfg) next_state = S_TPU_LOAD;
+        else next_state = S_DONE;
       end
-      S_L1_COMP: next_state = op_mac_acc4 ? S_L1_SUM : S_DONE;
-      S_L1_SUM: next_state = S_L1_ACC;
-      S_ADD, S_L1_ACC: next_state = S_DONE;
-      S_L1_AXI, S_CONV_LOAD: if (axi_cmd_done) next_state = S_DONE;
-      S_CONV_COMP: if (N == 0 || (p2_valid && p2_last)) next_state = S_DONE;
+      S_ADD: next_state = S_DONE;
       S_LOGISTIC: if (logistic_done) next_state = S_DONE;
       S_TR_LOAD: if (axi_cmd_done) next_state = axi_cmd_err ? S_DONE : S_TR_PERM;
       S_TR_PERM: if (tr_permute_done) next_state = S_TR_STORE;
       S_TR_STORE: if (axi_cmd_done) next_state = S_DONE;
+      S_TPU_LOAD:
+      if (axi_cmd_done) begin
+        if (axi_cmd_err) next_state = S_DONE;
+        else if (loading_b) next_state = S_TPU_WORK;
+      end
+      S_TPU_WORK:
+      if (tpu_busy) next_state = S_TPU_WORK;
+      else next_state = S_TPU_STORE;
+      S_TPU_STORE:
+      if (axi_cmd_done) next_state = S_DONE;
+      else next_state = S_TPU_STORE;
       S_DONE: next_state = S_IDLE;
       default: next_state = S_IDLE;
     endcase
   end
 
-  //============================================================================
-  // FSM part 3/3: datapath / output registers
-  //============================================================================
   always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
-      NPU_out             <= 32'd0;
-      NPU_done            <= 1'b0;
-      acc_r               <= 32'sd0;
-      offset              <= 32'sd0;
-      l1_a_bytes          <= 32'd0;
-      l1_b_bytes          <= 32'd0;
-      mac_sum_r           <= 32'sd0;
-      N                   <= 9'd0;
-      input_offset        <= 9'sd0;
-      ptr1_byte_off       <= 2'd0;
-      ptr2_byte_off       <= 2'd0;
-      conv_load_ptr2      <= 1'b0;
-      conv_rd_idx         <= 0;
-      conv_rd_valid       <= 1'b0;
-      conv_data_idx       <= 0;
-      ptr1_prev_word      <= 32'd0;
-      ptr2_prev_word      <= 32'd0;
-      accum               <= 32'sd0;
-      p1_valid            <= 1'b0;
-      p1_last             <= 1'b0;
-      p1_in_bytes         <= 32'd0;
-      p1_flt_bytes        <= 32'd0;
-      p1_group_byte       <= 32'd0;
-      p2_valid            <= 1'b0;
-      p2_last             <= 1'b0;
-      p2_sum              <= 32'sd0;
-      axi_cmd_start       <= 1'b0;
-      axi_cmd_write       <= 1'b0;
-      axi_cmd_addr        <= 32'd0;
-      axi_cmd_beats       <= 0;
+      NPU_out <= 32'd0;
+      NPU_done <= 1'b0;
+      axi_cmd_start <= 1'b0;
+      axi_cmd_write <= 1'b0;
+      axi_cmd_addr <= 32'd0;
+      axi_cmd_beats <= 0;
       axi_cmd_first_wstrb <= 4'b1111;
-      axi_cmd_last_wstrb  <= 4'b1111;
-      tr_permute_start    <= 1'b0;
-    end else begin
-      NPU_done         <= 1'b0;
-      axi_cmd_start    <= 1'b0;
+      axi_cmd_last_wstrb <= 4'b1111;
       tr_permute_start <= 1'b0;
-
+      loading_b <= 1'b0;
+      tpu_in_valid <= 1'b0;
+    end else begin
+      NPU_done <= 1'b0;
+      axi_cmd_start <= 1'b0;
+      tr_permute_start <= 1'b0;
+      tpu_in_valid <= 1'b0;
       case (state_r)
-        S_IDLE: begin
-          conv_rd_idx   <= 0;
-          conv_rd_valid <= 1'b0;
-          p1_valid      <= 1'b0;
-          p1_last       <= 1'b0;
-          p2_valid      <= 1'b0;
-          p2_last       <= 1'b0;
-          accum         <= 32'sd0;
-          l1_a_bytes    <= rs1_i;
-          l1_b_bytes    <= rs2_i;
-          if (NPU_start) begin
-            if (op_axi_read) begin
+        S_IDLE:
+        if (NPU_start) begin
+          if (op_tr_cfg) NPU_out <= 32'd0;
+          else if (op_tr_start) begin
+            if (tr_bad_cfg) NPU_out <= 32'd2;
+            else if (tr_total_bytes == 0) NPU_out <= 32'd0;
+            else begin
               axi_cmd_start <= 1'b1;
               axi_cmd_write <= 1'b0;
-              axi_cmd_addr  <= rs1_i;
-              axi_cmd_beats <= l1_misaligned ? 2 : 1;
+              axi_cmd_addr  <= tr_src_base_addr;
+              axi_cmd_beats <= tr_beats;
             end
-            if (op_axi_write) begin
-              axi_cmd_start       <= 1'b1;
-              axi_cmd_write       <= 1'b1;
-              axi_cmd_addr        <= rs1_i;
-              axi_cmd_beats       <= l1_misaligned ? 2 : 1;
-              axi_cmd_first_wstrb <= l1_wstrb0;
-              axi_cmd_last_wstrb  <= l1_wstrb1;
-            end
-            if (op_conv_config) begin
-              N            <= rs1_i[8:0];
-              input_offset <= $signed(rs2_i[8:0]);
-            end
-            if (op_conv_load_ptr1 || op_conv_load_ptr2) begin
-              conv_load_ptr2 <= op_conv_load_ptr2;
-              if (op_conv_load_ptr1) ptr1_byte_off <= rs1_i[1:0];
-              else ptr2_byte_off <= rs1_i[1:0];
-              axi_cmd_start <= 1'b1;
-              axi_cmd_write <= 1'b0;
-              axi_cmd_addr  <= rs1_i;
-              axi_cmd_beats <= ({2'b00, N} + rs1_i[1:0] + 11'd3) >> 2;
-            end
-            if (op_tr_cfg) NPU_out <= 32'd0;  // the register is written via start_op
-            if (op_tr_start) begin
-              if (tr_bad_cfg) begin
-                NPU_out <= 32'd2;
-              end else if (tr_total_bytes == 0) begin
-                NPU_out <= 32'd0;
-              end else begin
+          end else if (op_tpu) begin
+            if (tpu_start_cmd) begin
+              if (tpu_bad_cfg) NPU_out <= 32'd2;
+              else begin
+                loading_b <= 1'b0;
                 axi_cmd_start <= 1'b1;
                 axi_cmd_write <= 1'b0;
-                axi_cmd_addr  <= tr_src_base_addr;
-                axi_cmd_beats <= tr_beats;
+                axi_cmd_addr <= matA_addr;
+                axi_cmd_beats <= tpu_a_words[IDX_W:0];
               end
-            end
-          end
+            end else NPU_out <= 32'd0;
+          end else if (!op_add && !op_logistic) NPU_out <= 32'd3;
         end
-
-        S_L1_COMP: begin
-          if (op_mac_clear) begin
-            NPU_out <= 32'b0;
-            acc_r   <= 32'b0;
-          end else if (op_mac_set_offset) begin
-            offset <= rs1_i;
-          end
-        end
-
-        S_L1_SUM: mac_sum_r <= mac_sum;
-
-        S_L1_ACC: begin
-          acc_r   <= acc_r + mac_sum_r;
-          NPU_out <= acc_r + mac_sum_r;
-        end
-
         S_ADD: NPU_out <= rs1_i + rs2_i + funct7_i;
-
-        S_L1_AXI: begin
-          if (op_axi_read && axi_rd_valid) begin
-            if (axi_rd_idx == 0) NPU_out <= axi_rd_word >> l1_shift;
-            else NPU_out <= NPU_out | (axi_rd_word << (6'd32 - l1_shift));
-          end
-        end
-
-        S_CONV_COMP: begin
-          conv_rd_idx   <= conv_rd_idx + 1'b1;
-          conv_rd_valid <= 1'b1;
-          conv_data_idx <= conv_rd_idx;
-          if (conv_rd_valid) begin
-            ptr1_prev_word <= buf_a_rd_word;
-            ptr2_prev_word <= buf_b_rd_word;
-          end
-          // P1
-          p1_valid      <= conv_group_valid;
-          p1_last       <= conv_group_valid && conv_last_group;
-          p1_in_bytes   <= lane_in_bytes;
-          p1_flt_bytes  <= lane_flt_bytes;
-          p1_group_byte <= {conv_group, 2'b00};
-          // P2
-          p2_valid      <= p1_valid;
-          p2_last       <= p1_last;
-          p2_sum        <= compute_sum;
-          // accumulate
-          if (N == 0) begin
-            NPU_out <= 32'd0;
-          end else if (p2_valid) begin
-            accum <= accum + p2_sum;
-            if (p2_last) NPU_out <= accum + p2_sum;
-          end
-        end
-
         S_LOGISTIC: NPU_out <= logistic_result;
-
-        S_TR_LOAD: begin
-          if (axi_cmd_done) begin
-            if (axi_cmd_err) NPU_out <= 32'd1;
-            else tr_permute_start <= 1'b1;
-          end
+        S_TR_LOAD:
+        if (axi_cmd_done) begin
+          if (axi_cmd_err) NPU_out <= 32'd1;
+          else tr_permute_start <= 1'b1;
         end
-
-        S_TR_PERM: begin
-          if (tr_permute_done) begin
-            axi_cmd_start       <= 1'b1;
-            axi_cmd_write       <= 1'b1;
-            axi_cmd_addr        <= tr_dst_base_addr;
-            axi_cmd_beats       <= tr_beats;
-            axi_cmd_first_wstrb <= 4'b1111;
-            axi_cmd_last_wstrb  <= tr_last_wstrb;
-          end
+        S_TR_PERM:
+        if (tr_permute_done) begin
+          axi_cmd_start <= 1'b1;
+          axi_cmd_write <= 1'b1;
+          axi_cmd_addr <= tr_dst_base_addr;
+          axi_cmd_beats <= tr_beats;
+          axi_cmd_first_wstrb <= 4'b1111;
+          axi_cmd_last_wstrb <= tr_last_wstrb;
         end
-
         S_TR_STORE: if (axi_cmd_done) NPU_out <= axi_cmd_err ? 32'd1 : 32'd0;
-
+        S_TPU_LOAD:
+        if (axi_cmd_done) begin
+          if (axi_cmd_err) NPU_out <= 32'd1;
+          else if (!loading_b) begin
+            loading_b <= 1'b1;
+            axi_cmd_start <= 1'b1;
+            axi_cmd_write <= 1'b0;
+            axi_cmd_addr <= matB_addr;
+            axi_cmd_beats <= {{(IDX_W - 7) {1'b0}}, K};
+          end else begin
+            // The final B beat has reached BRAM; start TPU for one cycle.
+            tpu_in_valid <= 1'b1;
+          end
+        end
+        S_TPU_WORK:
+        if (!tpu_busy) begin
+          // All C words are in BRAM. Start the write once, on entry to STORE.
+          axi_cmd_start <= 1'b1;
+          axi_cmd_write <= 1'b1;
+          axi_cmd_addr <= matC_addr;
+          axi_cmd_beats <= {{(IDX_W - 7) {1'b0}}, M};
+          axi_cmd_first_wstrb <= 4'b1111;
+          axi_cmd_last_wstrb <= 4'b1111;
+        end
+        S_TPU_STORE: if (axi_cmd_done) NPU_out <= axi_cmd_err ? 32'd1 : 32'd0;
         S_DONE: NPU_done <= 1'b1;
-
         default: ;
       endcase
     end
   end
-
 endmodule

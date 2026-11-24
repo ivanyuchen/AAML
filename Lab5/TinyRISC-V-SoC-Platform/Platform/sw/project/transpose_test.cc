@@ -4,7 +4,6 @@
 
 #include "tensorflow/lite/kernels/internal/types.h"
 #include "tensorflow/lite/kernels/internal/reference/transpose.h"
-#include "cbo.h"   // cbo_clean / cbo_invalidate
 
 namespace {
 
@@ -83,15 +82,6 @@ void ReferenceTranspose(const int8_t* in, int8_t* out, int dims,
   }
 }
 
-// Write cached data back to memory so the CFU sees it / sentinel is in DRAM.
-void CleanRange(const void* ptr, uintptr_t bytes) {
-  uintptr_t start = (uintptr_t)ptr & ~(uintptr_t)0x1f;
-  uintptr_t end   = (uintptr_t)ptr + bytes;
-  for (uintptr_t a = start; a < end; a += 32) {
-    cbo_clean((void*)a);
-  }
-}
-
 bool RunTransposeCase(const TransposeCase& c) {
   const int dims = c.dims;
 
@@ -125,8 +115,6 @@ bool RunTransposeCase(const TransposeCase& c) {
   // Output buffer (and guard) = sentinel, and make sure it's in memory,
   // so stale dirty lines can't overwrite the CFU's result later.
   memset(g_out, kSentinel, sizeof(g_out));
-  CleanRange(g_in, sizeof(g_in));
-  CleanRange(g_out, sizeof(g_out));
 
   // Build parameters and shapes.
   tflite::TransposeParams params;

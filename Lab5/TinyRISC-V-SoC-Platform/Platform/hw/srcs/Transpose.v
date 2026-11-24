@@ -6,8 +6,8 @@
 //   dst  = output tensor (built in dst_buf, NPU stores it to DDR)
 //   word = one 32-bit AXI beat = one buffer entry
 //
-// src_buf / dst_buf are bram_sdp instances owned by the NPU and shared with
-// Conv (Lab2 ptr1 / ptr2 buffers). This module only sees:
+// src_buf / dst_buf are bram_sdp instances owned by the NPU.
+// This module only sees:
 //   src_buf read port  (src_rd_idx -> src_rd_word, 1-cycle latency)
 //   dst_buf write port (dst_wr_en / dst_wr_idx / dst_wr_word)
 //

@@ -5,6 +5,7 @@
 extern void run_logistic_test();
 extern void run_transpose_test();
 extern void systolic_test();
+extern void run_lab5_coherence_test();
 
 namespace {
 
@@ -12,6 +13,7 @@ const MenuItem kLabItems[] = {
     MENU_ITEM('l', "run logistic test", run_logistic_test),
     MENU_ITEM('t', "run transpose test", run_transpose_test),
     MENU_ITEM('s', "run Lab5 systolic tests", systolic_test),
+    MENU_ITEM('c', "run Lab5 cache coherence tests", run_lab5_coherence_test),
     MENU_END,
 };
 

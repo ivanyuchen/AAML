@@ -20,7 +20,6 @@ limitations under the License.
 #include "tensorflow/lite/kernels/internal/types.h"
 #include "perf.h"
 #include "cfu.h"
-#include "cbo.h"
 #include <stdio.h>
 
 namespace tflite
@@ -191,7 +190,6 @@ namespace tflite
       // by byte, then burst-writes the output, so the CPU never touches the
       // tensor data. Limits come from the hardware (see NPU.v / Transpose.v).
       //------------------------------------------------------------------------
-      constexpr uintptr_t kCacheLineBytes = 32;
       constexpr uint32_t kNpuTransposeMaxBytes = 16384; // NPU TR_BUF_BYTES
       constexpr int kNpuTransposeMaxRank = 6;           // Transpose MAX_RANK
 
@@ -202,22 +200,6 @@ namespace tflite
 #define NPU_TR_CFG_DST_SHAPE 2  // rs1 = dim d,    rs2 = output_shape[d]
 #define NPU_TR_CFG_SRC_STRIDE 3 // rs1 = dim d,    rs2 = byte stride of input
                                 //                 along output dim d
-
-      inline void CleanCacheRange(const void *ptr, uint32_t bytes)
-      {
-        uintptr_t line = reinterpret_cast<uintptr_t>(ptr) & ~(kCacheLineBytes - 1);
-        const uintptr_t end = reinterpret_cast<uintptr_t>(ptr) + bytes;
-        for (; line < end; line += kCacheLineBytes)
-          cbo_clean(reinterpret_cast<const void *>(line));
-      }
-
-      inline void InvalidateCacheRange(const void *ptr, uint32_t bytes)
-      {
-        uintptr_t line = reinterpret_cast<uintptr_t>(ptr) & ~(kCacheLineBytes - 1);
-        const uintptr_t end = reinterpret_cast<uintptr_t>(ptr) + bytes;
-        for (; line < end; line += kCacheLineBytes)
-          cbo_invalidate(reinterpret_cast<const void *>(line));
-      }
 
       // Runs the transpose on the NPU. Returns false (nothing written) when the
       // shape is outside what the hardware supports, or when the NPU reports an
@@ -249,12 +231,7 @@ namespace tflite
             return false;
         }
 
-        // Input: write dirty lines back so the NPU reads current data.
-        // Output: write back dirty lines (incl. neighbours sharing the first /
-        // last line) now, and drop the stale copies after the NPU has written.
-        CleanCacheRange(input_data, total_bytes);
-        CleanCacheRange(output_data, total_bytes);
-
+        // Transpose START also uses hardware D-cache writeback/invalidation.
         cfu_op5(NPU_TR_CFG_ADDR, input_data, output_data);
         cfu_op5(NPU_TR_CFG_SIZE, hw_rank, total_bytes);
         for (int d = 0; d < dims; ++d)
@@ -269,7 +246,6 @@ namespace tflite
         }
         const uint32_t status = cfu_op6(0, 0, 0); // 0 ok, 1 AXI error, 2 bad cfg
 
-        InvalidateCacheRange(output_data, total_bytes);
         return status == 0;
       }
 
