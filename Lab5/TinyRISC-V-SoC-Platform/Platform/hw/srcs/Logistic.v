@@ -60,6 +60,12 @@ module Logistic (
   endfunction
 
 
+  // Two shared arithmetic units. Each stage selects operands below.
+  // Keep Logistic_mul's original product width and rounding unchanged.
+  reg signed [31:0] mul0_a, mul0_b, mul1_a, mul1_b;
+  wire signed [31:0] mul0_result = Logistic_mul(mul0_a, mul0_b);
+  wire signed [31:0] mul1_result = Logistic_mul(mul1_a, mul1_b);
+
   reg [3:0] stage;
   localparam stage_1 = 0;
   wire [31:0] t = (input_a[31] == 1'b1) ? -input_a : input_a;
@@ -86,18 +92,18 @@ module Logistic (
     end else if (stage == stage_2) begin
       stage_2_step <= stage_2_step + 1;
       if (stage_2_step == stage_2_0) begin
-        stage_2_u2 <= Logistic_mul(stage_2_u1, stage_2_u1);  // u^2
+        stage_2_u2 <= mul0_result;  // u^2
       end else if (stage_2_step == stage_2_1) begin
-        stage_2_u3 <= Logistic_mul(stage_2_u2, stage_2_u1);  // u^3
-        stage_2_u4 <= Logistic_mul(stage_2_u2, stage_2_u2);  // u^4
+        stage_2_u3 <= mul0_result;  // u^3
+        stage_2_u4 <= mul1_result;  // u^4
       end else if (stage_2_step == stage_2_2) begin
         stage_2_acc <= rounding_divide_by_pot(stage_2_u4, 2) + stage_2_u3;
       end else if (stage_2_step == stage_2_3) begin
-        stage_2_u3 <= Logistic_mul(stage_2_acc, constant_1_over_3);
+        stage_2_u3 <= mul0_result;
       end else if (stage_2_step == stage_2_4) begin
         stage_2_acc <= stage_2_u1 + rounding_divide_by_pot(stage_2_u3 + stage_2_u2, 1);
       end else if (stage_2_step == stage_2_5) begin
-        stage_2_acc <= exp_neg_1_over_8 + Logistic_mul(exp_neg_1_over_8, stage_2_acc);
+        stage_2_acc <= exp_neg_1_over_8 + mul0_result;
       end
     end
   end
@@ -129,7 +135,7 @@ module Logistic (
         stage_3_acc  <= stage_2_acc;  // start with exp(m)
         stage_3_step <= 3'd1;
       end else if (stage_3_step <= 3'd6) begin
-        if (r[24+stage_3_step]) stage_3_acc <= Logistic_mul(stage_3_acc, exp_factor(stage_3_step));
+        if (r[24+stage_3_step]) stage_3_acc <= mul0_result;
         stage_3_step <= stage_3_step + 3'd1;
       end
     end
@@ -143,6 +149,44 @@ module Logistic (
   reg [2:0] stage_5_step;
   reg signed [31:0] z;  // Q2.29 estimate of 1/h
   reg signed [31:0] one_minus_hz;  // Q2.29
+
+  // Operand muxes are BEFORE the multipliers, so different stages reuse
+  // the same hardware. Only stage_2_1 needs both multipliers in parallel.
+  always @(*) begin
+    mul0_a = 32'sd0;
+    mul0_b = 32'sd0;
+    mul1_a = 32'sd0;
+    mul1_b = 32'sd0;
+    case (stage)
+      stage_2: begin
+        case (stage_2_step)
+          stage_2_0: begin mul0_a = stage_2_u1; mul0_b = stage_2_u1; end
+          stage_2_1: begin
+            mul0_a = stage_2_u2; mul0_b = stage_2_u1;
+            mul1_a = stage_2_u2; mul1_b = stage_2_u2;
+          end
+          stage_2_3: begin mul0_a = stage_2_acc; mul0_b = constant_1_over_3; end
+          stage_2_5: begin mul0_a = exp_neg_1_over_8; mul0_b = stage_2_acc; end
+          default: ;
+        endcase
+      end
+      stage_3: begin
+        if (stage_3_step >= 3'd1 && stage_3_step <= 3'd6) begin
+          mul0_a = stage_3_acc;
+          mul0_b = exp_factor(stage_3_step);
+        end
+      end
+      stage_5: begin
+        case (stage_5_step)
+          3'd0: begin mul0_a = h; mul0_b = const_neg_32_over_17; end
+          3'd1, 3'd3, 3'd5: begin mul0_a = h; mul0_b = z; end
+          3'd2, 3'd4, 3'd6: begin mul0_a = z; mul0_b = one_minus_hz; end
+          default: ;
+        endcase
+      end
+      default: ;
+    endcase
+  end
   always @(posedge clk or negedge rst_n) begin
     if (!rst_n || stage != stage_5) begin
       stage_5_step <= 3'd0;
@@ -150,10 +194,10 @@ module Logistic (
       if (stage_5_step <= 3'd6) begin
         stage_5_step <= stage_5_step + 3'd1;
         case (stage_5_step)
-          3'd0: z <= const_48_over_17 + Logistic_mul(h, const_neg_32_over_17);
-          3'd1, 3'd3, 3'd5: one_minus_hz <= Fixedpoint_Q229_ONE - Logistic_mul(h, z);
+          3'd0: z <= const_48_over_17 + mul0_result;
+          3'd1, 3'd3, 3'd5: one_minus_hz <= Fixedpoint_Q229_ONE - mul0_result;
           3'd2, 3'd4, 3'd6:
-          z <= z + saturating_rounding_multiply_by_pot(Logistic_mul(z, one_minus_hz), 2);
+          z <= z + saturating_rounding_multiply_by_pot(mul0_result, 2);
         endcase
       end
     end

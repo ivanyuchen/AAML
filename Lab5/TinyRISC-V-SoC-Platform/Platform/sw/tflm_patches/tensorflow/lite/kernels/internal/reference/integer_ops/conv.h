@@ -17,8 +17,8 @@ limitations under the License.
 
 #include <algorithm>
 
-#include "perf.h"
 #include "lab5_api.h"
+#include "perf.h"
 #include "tensorflow/lite/kernels/internal/common.h"
 #include "tensorflow/lite/kernels/internal/portable_tensor_utils.h"
 
@@ -92,8 +92,9 @@ inline void ConvPerChannel(const ConvParams &params, const int32_t *output_multi
                 for (int out_channel = 0; out_channel < output_depth;)
                 {
                     const int group = out_channel / filters_per_group;
-                    const int M = std::min(4, std::min(output_depth - out_channel,
-                                                      filters_per_group - out_channel % filters_per_group));
+                    const int M =
+                        std::min(4, std::min(output_depth - out_channel,
+                                             filters_per_group - out_channel % filters_per_group));
                     const int K = filter_height * filter_width * filter_input_depth;
                     // Fixed-size buffers: no malloc or runtime-sized stack arrays.
                     static int8_t patch[254];
@@ -104,27 +105,39 @@ inline void ConvPerChannel(const ConvParams &params, const int32_t *output_multi
                     for (int k_begin = 0; k_begin < K; k_begin += 254)
                     {
                         const int tile_k = std::min(254, K - k_begin);
+                        int in_channel = k_begin % filter_input_depth;
+                        int filter_x = (k_begin / filter_input_depth) % filter_width;
+                        int filter_y = k_begin / (filter_input_depth * filter_width);
+
                         int32_t filter_sum[4] = {0, 0, 0, 0};
                         for (int k = 0; k < tile_k; ++k)
                         {
                             // Flatten order: filter_y -> filter_x -> input channel.
                             const int index = k_begin + k;
-                            const int in_channel = index % filter_input_depth;
-                            const int filter_x = (index / filter_input_depth) % filter_width;
-                            const int filter_y = index / (filter_input_depth * filter_width);
                             const int in_y = in_y_origin + filter_y * dilation_height_factor;
                             const int in_x = in_x_origin + filter_x * dilation_width_factor;
-                            const bool inside = in_y >= 0 && in_y < input_height &&
-                                                in_x >= 0 && in_x < input_width;
-                            patch[k] = inside ? input_data[Offset(input_shape, batch, in_y, in_x,
-                                                    in_channel + group * filter_input_depth)] : 0;
+                            const bool inside =
+                                in_y >= 0 && in_y < input_height && in_x >= 0 && in_x < input_width;
+                            patch[k] =
+                                inside ? input_data[Offset(input_shape, batch, in_y, in_x,
+                                                           in_channel + group * filter_input_depth)]
+                                       : 0;
                             for (int lane = 0; lane < M; ++lane)
                             {
                                 // Omit padding terms by zeroing both the weight and input.
-                                const int8_t weight = inside ?
-                                    filter_data[(out_channel + lane) * K + index] : 0;
+                                const int8_t weight =
+                                    inside ? filter_data[(out_channel + lane) * K + index] : 0;
                                 filter_tile[lane * tile_k + k] = weight;
                                 filter_sum[lane] += weight;
+                            }
+                            if (++in_channel == filter_input_depth)
+                            {
+                                in_channel = 0;
+                                if (++filter_x == filter_width)
+                                {
+                                    filter_x = 0;
+                                    ++filter_y;
+                                }
                             }
                         }
                         // A: M filter rows. B: one input patch. C: M partial sums.
