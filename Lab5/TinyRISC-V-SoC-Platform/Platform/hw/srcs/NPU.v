@@ -473,12 +473,12 @@ module NPU (
               if (tpu_bad_cfg) NPU_out <= 32'd2;
               else begin
                 loading_b <= 1'b0;
-                axi_cmd_start <= 1'b0;
+                axi_cmd_start <= 1'b1;
                 axi_cmd_write <= 1'b0;
                 axi_cmd_addr <= matA_addr;
                 axi_cmd_beats <= tpu_a_words[IDX_W:0];
               end
-            end else NPU_out <= 16'd0;
+            end else NPU_out <= 32'd0;
           end else if (!op_add && !op_logistic) NPU_out <= 32'd3;
         end
         S_ADD: NPU_out <= rs1_i + rs2_i + funct7_i;
