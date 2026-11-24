@@ -109,49 +109,49 @@ module NPU (
              S_TR_PERM = 4'd5, S_TR_STORE = 4'd6,
              S_TPU_LOAD = 4'd7, S_TPU_WORK = 4'd8, S_TPU_STORE = 4'd9;
   reg [3:0] state_r, next_state;
-  wire             start_op = (state_r == S_IDLE) && NPU_start;
-  wire             op_add = (funct3_i[2:0] == 3'd0) && (funct7_i > 32'd2);
-  wire             op_logistic = (funct3_i[2:0] == 3'd4);
-  wire             op_tr_cfg = (funct3_i[2:0] == 3'd5);
-  wire             op_tr_start = (funct3_i[2:0] == 3'd6);
-  wire             op_tpu = (funct3_i[2:0] == 3'd7);
+  wire               start_op = (state_r == S_IDLE) && NPU_start;
+  wire               op_add = (funct3_i[2:0] == 3'd0) && (funct7_i > 32'd2);
+  wire               op_logistic = (funct3_i[2:0] == 3'd4);
+  wire               op_tr_cfg = (funct3_i[2:0] == 3'd5);
+  wire               op_tr_start = (funct3_i[2:0] == 3'd6);
+  wire               op_tpu = (funct3_i[2:0] == 3'd7);
 
   //============================================================================
   // Sub-module wires
   //============================================================================
   // NPU_axi
-  reg              axi_cmd_start;
-  reg              axi_cmd_write;
-  reg  [     31:0] axi_cmd_addr;
-  reg  [  IDX_W:0] axi_cmd_beats;
-  reg  [      3:0] axi_cmd_first_wstrb;
-  reg  [      3:0] axi_cmd_last_wstrb;
-  wire             axi_cmd_done;
-  wire             axi_cmd_err;
-  wire             axi_rd_valid;
-  wire [IDX_W-1:0] axi_rd_idx;
-  wire [     31:0] axi_rd_word;
-  wire [IDX_W-1:0] axi_wr_idx;
-  reg  [     31:0] axi_wr_word;
+  reg                axi_cmd_start;
+  reg                axi_cmd_write;
+  reg  [       31:0] axi_cmd_addr;
+  reg  [    IDX_W:0] axi_cmd_beats;
+  reg  [        3:0] axi_cmd_first_wstrb;
+  reg  [        3:0] axi_cmd_last_wstrb;
+  wire               axi_cmd_done;
+  wire               axi_cmd_err;
+  wire               axi_rd_valid;
+  wire [  IDX_W-1:0] axi_rd_idx;
+  wire [       31:0] axi_rd_word;
+  wire [  IDX_W-1:0] axi_wr_idx;
+  reg  [       31:0] axi_wr_word;
 
   // buf_a / buf_b
-  reg              buf_a_we;
-  reg  [IDX_W-1:0] buf_a_wr_idx;
-  reg  [     31:0] buf_a_wr_word;
-  reg  [IDX_W-1:0] buf_a_rd_idx;
-  wire [     31:0] buf_a_rd_word;
-  reg              buf_b_we;
-  reg  [IDX_W-1:0] buf_b_wr_idx;
-  reg  [     31:0] buf_b_wr_word;
-  reg  [IDX_W-1:0] buf_b_rd_idx;
-  wire [     31:0] buf_b_rd_word;
+  reg                buf_a_we;
+  reg  [  IDX_W-1:0] buf_a_wr_idx;
+  reg  [       31:0] buf_a_wr_word;
+  reg  [  IDX_W-1:0] buf_a_rd_idx;
+  wire [       31:0] buf_a_rd_word;
+  reg                buf_b_we;
+  reg  [  IDX_W-1:0] buf_b_wr_idx;
+  reg  [       31:0] buf_b_wr_word;
+  reg  [  IDX_W-1:0] buf_b_rd_idx;
+  wire [       31:0] buf_b_rd_word;
 
   // TPU C buffer ports: one signed int32 result per word.
-  reg              buf_c_we;
+  reg                buf_c_we;
   reg  [C_IDX_W-1:0] buf_c_wr_idx;
-  reg  [     31:0] buf_c_wr_word;
+  reg  [       31:0] buf_c_wr_word;
   reg  [C_IDX_W-1:0] buf_c_rd_idx;
-  wire [     31:0] buf_c_rd_word;
+  wire [       31:0] buf_c_rd_word;
 
   wire [15:0] tpu_a_idx, tpu_b_idx, tpu_c_idx;
   wire tpu_c_ram_en, tpu_c_wr_en;
@@ -473,12 +473,12 @@ module NPU (
               if (tpu_bad_cfg) NPU_out <= 32'd2;
               else begin
                 loading_b <= 1'b0;
-                axi_cmd_start <= 1'b1;
+                axi_cmd_start <= 1'b0;
                 axi_cmd_write <= 1'b0;
                 axi_cmd_addr <= matA_addr;
                 axi_cmd_beats <= tpu_a_words[IDX_W:0];
               end
-            end else NPU_out <= 32'd0;
+            end else NPU_out <= 16'd0;
           end else if (!op_add && !op_logistic) NPU_out <= 32'd3;
         end
         S_ADD: NPU_out <= rs1_i + rs2_i + funct7_i;
