@@ -81,6 +81,136 @@ inline void ConvPerChannel(const ConvParams &params, const int32_t *output_multi
     const int filters_per_group = output_depth / groups;
     const int output_height = output_shape.Dims(1);
     const int output_width = output_shape.Dims(2);
+    // Pack weights once per invocation, and one input vector per output position.
+    // These are bounded scratch buffers in DDR, not dynamically allocated memory.
+    const int full_k = filter_height * filter_width * filter_input_depth;
+    const int rows_per_group = (filters_per_group + 3) / 4;
+    const uint64_t packed_word_count = static_cast<uint64_t>(groups) * rows_per_group * full_k;
+    if (full_k > 0 && full_k <= 65536 && output_depth <= 4096 &&
+        packed_word_count <= 65536 && input_offset >= -127 && input_offset <= 128)
+    {
+        static uint32_t packed_filters[65536];
+        static uint32_t packed_patch[65536];
+        static int32_t channel_bias[4096];
+        static int32_t partial[252];
+        static int32_t accum[252];
+        const int tile_limit = std::min(254, full_k);
+        // Multiples of four keep each packed channel block word-aligned.
+        const int block_rows = std::min(252, 4 * (1024 / tile_limit));
+        for (int channel = 0; channel < output_depth; ++channel)
+            channel_bias[channel] = 0;
+        int packed_index = 0;
+        for (int group = 0; group < groups; ++group)
+        {
+            for (int oc = 0; oc < filters_per_group; oc += block_rows)
+            {
+                const int M = std::min(block_rows, filters_per_group - oc);
+                for (int kb = 0; kb < full_k; kb += tile_limit)
+                {
+                    const int tile_k = std::min(tile_limit, full_k - kb);
+                    for (int row = 0; row < M; row += 4)
+                    {
+                        for (int k = 0; k < tile_k; ++k)
+                        {
+                            uint32_t word = 0;
+                            for (int lane = 0; lane < 4 && row + lane < M; ++lane)
+                            {
+                                const int channel = group * filters_per_group + oc + row + lane;
+                                const int8_t weight = filter_data[channel * full_k + kb + k];
+                                word |= static_cast<uint32_t>(static_cast<uint8_t>(weight)) << (24 - 8 * lane);
+                                channel_bias[channel] += weight;
+                            }
+                            packed_filters[packed_index++] = word;
+                        }
+                    }
+                }
+            }
+        }
+        // Offset and bias depend only on the filter, not on the output position.
+        for (int channel = 0; channel < output_depth; ++channel)
+        {
+            const int64_t correction = static_cast<int64_t>(input_offset) * channel_bias[channel] +
+                                       (bias_data ? bias_data[channel] : 0);
+            channel_bias[channel] = static_cast<int32_t>(correction);
+        }
+        const bool one_tile = full_k <= tile_limit;
+        // A padded raw input equals the input zero point, so x+offset is zero.
+        // This lets the same packed filters be reused at padded boundaries too.
+        const uint32_t padding_word = static_cast<uint32_t>(
+            static_cast<uint8_t>(-input_offset)) << 24;
+        for (int batch = 0; batch < batches; ++batch)
+        {
+            for (int out_y = 0; out_y < output_height; ++out_y)
+            {
+                const int in_y_origin = out_y * stride_height - pad_height;
+                for (int out_x = 0; out_x < output_width; ++out_x)
+                {
+                    const int in_x_origin = out_x * stride_width - pad_width;
+                    for (int group = 0; group < groups; ++group)
+                    {
+                        int patch_index = 0;
+                        for (int fy = 0; fy < filter_height; ++fy)
+                        {
+                            const int in_y = in_y_origin + fy * dilation_height_factor;
+                            for (int fx = 0; fx < filter_width; ++fx)
+                            {
+                                const int in_x = in_x_origin + fx * dilation_width_factor;
+                                const bool inside = in_y >= 0 && in_y < input_height &&
+                                                    in_x >= 0 && in_x < input_width;
+                                if (inside)
+                                {
+                                    const int8_t* src = input_data + Offset(input_shape, batch, in_y,
+                                        in_x, group * filter_input_depth);
+                                    for (int ic = 0; ic < filter_input_depth; ++ic)
+                                        packed_patch[patch_index++] = static_cast<uint32_t>(
+                                            static_cast<uint8_t>(src[ic])) << 24;
+                                }
+                                else
+                                {
+                                    for (int ic = 0; ic < filter_input_depth; ++ic)
+                                        packed_patch[patch_index++] = padding_word;
+                                }
+                            }
+                        }
+                        for (int oc = 0; oc < filters_per_group; oc += block_rows)
+                        {
+                            const int M = std::min(block_rows, filters_per_group - oc);
+                            const int row_blocks = (M + 3) / 4;
+                            uint32_t* weights = packed_filters + group * rows_per_group * full_k +
+                                                (oc / 4) * full_k;
+                            if (!one_tile)
+                                for (int row = 0; row < M; ++row) accum[row] = 0;
+                            for (int kb = 0; kb < full_k; kb += tile_limit)
+                            {
+                                const int tile_k = std::min(tile_limit, full_k - kb);
+                                do_gemv(M, tile_k, weights, packed_patch + kb, partial);
+                                weights += row_blocks * tile_k;
+                                if (!one_tile)
+                                    for (int row = 0; row < M; ++row) accum[row] += partial[row];
+                            }
+                            for (int row = 0; row < M; ++row)
+                            {
+                                const int channel = group * filters_per_group + oc + row;
+                                const int32_t dot = one_tile ? partial[row] : accum[row];
+                                int32_t acc = static_cast<int32_t>(static_cast<uint32_t>(dot) +
+                                                                   static_cast<uint32_t>(channel_bias[channel]));
+                                acc = MultiplyByQuantizedMultiplier(acc, output_multiplier[channel],
+                                                                    output_shift[channel]);
+                                acc += output_offset;
+                                acc = std::max(acc, output_activation_min);
+                                acc = std::min(acc, output_activation_max);
+                                output_data[Offset(output_shape, batch, out_y, out_x, channel)] =
+                                    static_cast<int8_t>(acc);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    else
+    {
+        // General bounded-memory fallback for layers larger than the scratch cache.
     for (int batch = 0; batch < batches; ++batch)
     {
         for (int out_y = 0; out_y < output_height; ++out_y)
@@ -170,6 +300,8 @@ inline void ConvPerChannel(const ConvParams &params, const int32_t *output_multi
                 }
             }
         }
+    }
+
     }
 
     // =====================================================================================================
